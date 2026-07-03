@@ -4,7 +4,9 @@ import config/config
 import gleam/erlang/process
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
+import gleam/string
 import logging
+import matcher/piece_hasher
 import matcher/torrent_index
 import syncer
 import watcher/fs_watcher
@@ -69,5 +71,65 @@ fn start(config_path: String) -> Nil {
 }
 
 fn match_file(path: String) -> Nil {
-  todo as "hash the file's pieces and print the matching torrent, without touching qBittorrent"
+  case config.load("arr-sync.toml") {
+    Error(_reason) ->
+      logging.log(logging.Error, "failed to load config from arr-sync.toml")
+    Ok(loaded_config) -> {
+      let credentials =
+        qbittorrent.Credentials(
+          url: loaded_config.qbittorrent.url,
+          username: loaded_config.qbittorrent.username,
+          password: loaded_config.qbittorrent.password,
+        )
+      case qbittorrent.login(credentials) {
+        Error(_reason) -> logging.log(logging.Error, "qBittorrent login failed")
+        Ok(session) -> {
+          let index = torrent_index.fetch_index(session)
+          report_match(path, index)
+        }
+      }
+    }
+  }
+}
+
+fn report_match(path: String, index: torrent_index.Index) -> Nil {
+  case find_first_match(path, torrent_index.piece_sizes(index), index) {
+    Ok(torrent_index.Matched(torrent_hash)) ->
+      logging.log(logging.Info, path <> " matches torrent " <> torrent_hash)
+    Ok(torrent_index.Ambiguous(candidates)) ->
+      logging.log(
+        logging.Warning,
+        path <> " matches multiple torrents: " <> string.join(candidates, ", "),
+      )
+    Ok(torrent_index.NoMatch) | Error(Nil) ->
+      logging.log(logging.Info, "no torrent matches " <> path)
+  }
+}
+
+/// Tries each distinct piece size present in the index (a candidate file's
+/// piece hash only lines up with a torrent using the same piece size),
+/// stopping at the first size that produces a match.
+fn find_first_match(
+  path: String,
+  piece_sizes: List(Int),
+  index: torrent_index.Index,
+) -> Result(torrent_index.MatchResult, Nil) {
+  case piece_sizes {
+    [] -> Error(Nil)
+    [piece_size, ..rest] ->
+      case
+        piece_hasher.hash_first_pieces(
+          path,
+          piece_hasher.PieceSize(piece_size),
+          1,
+        )
+      {
+        Ok([piece_hash, ..]) ->
+          case torrent_index.find_match(index, piece_hash) {
+            torrent_index.NoMatch -> find_first_match(path, rest, index)
+            result -> Ok(result)
+          }
+        _ -> find_first_match(path, rest, index)
+      }
+  }
 }
