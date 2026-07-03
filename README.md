@@ -101,21 +101,23 @@ arr-sync resync <torrent_hash>                 # force a qBittorrent recheck
 
 ---
 
-## What's actually verified
+## Status
 
-Every piece was tested against real infrastructure (a real qBittorrent in Docker, a real filesystem, real multi-file torrents) instead of assumed correct because it compiled. That caught real bugs no code review would have:
+**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent.
 
-- qBittorrent 5.x replies **204** on a successful login, not 200
-- `progress` can arrive as a bare JSON integer (`1`) instead of a float (`1.0`) once a file is complete — a strict decoder rejects that
-- `setLocation` alone isn't enough for a rename: without `renameFile`, the torrent drops to 0% instead of resyncing
-- A piece hash duplicated **within the same torrent** (repetitive content) was mistaken for ambiguity between two different torrents
-- The `torrent_index` actor started with an empty index and nothing would ever have populated it — the daemon would never have matched anything
+**Not checked against a live instance**: Sonarr/Radarr notifications (HTTP client only, same shape as the qBittorrent one).
 
-**Verified live**: qBittorrent auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (byte-for-byte checked against `shasum`), the filesystem watcher (a real FSEvents stream), a full end-to-end resync on a renamed multi-file torrent.
+**Not implemented**: `arr-sync status` — would need distributed Erlang to query an already-running daemon; it errors out cleanly instead of crashing.
 
-**Not verified live**: Sonarr/Radarr notifications (structurally correct HTTP, same patterns as the already-verified qBittorrent client, but no instance on hand to test against for real).
+### qBittorrent API quirks
 
-**Not implemented**: `arr-sync status` would need to query an already-running daemon over distributed Erlang (named nodes + RPC) — it fails with a clear error instead of crashing.
+Worth knowing if you're touching `client/qbittorrent.gleam`:
+
+- Login replies **204** on success on qBittorrent 5.x, not 200
+- `progress` can be a bare JSON integer (`1`) instead of a float (`1.0`) once a file is complete
+- `piece_size` isn't in `torrents/info`, only in `torrents/properties`
+- `setLocation` alone doesn't fix a rename — without `renameFile`, the torrent drops to 0% instead of resyncing
+- `torrents/files` includes a `piece_range` per file, which avoids computing cumulative file offsets by hand
 
 ---
 
