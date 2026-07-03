@@ -4,6 +4,7 @@ import arr_sync/matcher/piece_hasher
 import filepath
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
@@ -67,8 +68,22 @@ pub type Index {
 }
 
 type IndexState {
-  IndexState(session: Session, index: Index)
+  IndexState(
+    credentials: qbittorrent.Credentials,
+    session: Session,
+    index: Index,
+    self: Subject(Message),
+  )
 }
+
+/// How often the index is rebuilt from qBittorrent on its own, so torrents
+/// added after the daemon started eventually become matchable — nothing
+/// else ever sends Refresh.
+const refresh_interval_ms = 300_000
+
+/// Retries for a transient qBittorrent failure (connection lost) or an
+/// expired session (re-authenticates first) before giving up.
+const max_retries = 3
 
 pub fn start(
   credentials: qbittorrent.Credentials,
@@ -76,13 +91,21 @@ pub fn start(
 ) -> actor.StartResult(Subject(Message)) {
   actor.new_with_initialiser(15_000, fn(subject) {
     case qbittorrent.login(credentials) {
-      Ok(session) ->
-        // Fetch the index synchronously at startup — nothing else ever
-        // sends Refresh on its own, so without this the actor would stay
-        // permanently empty and every match/resync would silently miss.
-        actor.initialised(IndexState(session:, index: fetch_index(session)))
+      Ok(session) -> {
+        // Fetch the index synchronously at startup — the first scheduled
+        // Refresh is 5 minutes away, so without this the actor would sit
+        // empty (and match nothing) until then.
+        let index = fetch_index_result(session) |> result.unwrap(empty_index())
+        process.send_after(subject, refresh_interval_ms, Refresh)
+        actor.initialised(IndexState(
+          credentials:,
+          session:,
+          index:,
+          self: subject,
+        ))
         |> actor.returning(subject)
         |> Ok
+      }
       Error(_reason) -> Error("qBittorrent login failed")
     }
   })
@@ -101,7 +124,21 @@ fn handle_message(
 ) -> actor.Next(IndexState, Message) {
   case message {
     Refresh -> {
-      let index = fetch_index(state.session)
+      let #(result, state) = with_retry(state, fetch_index_result)
+      let index = case result {
+        Ok(new_index) -> new_index
+        Error(reason) -> {
+          // Keep the last known-good index rather than wiping it — a
+          // transient qBittorrent outage shouldn't erase everything that
+          // was already matchable.
+          logging.log(
+            logging.Warning,
+            "refresh failed, keeping previous index: " <> string.inspect(reason),
+          )
+          state.index
+        }
+      }
+      process.send_after(state.self, refresh_interval_ms, Refresh)
       actor.continue(IndexState(..state, index:))
     }
     Lookup(piece_hash, reply_to) -> {
@@ -123,33 +160,106 @@ fn handle_message(
       actor.continue(state)
     }
     Resync(torrent_hash, piece_hash, new_absolute_path, reply_to) -> {
-      process.send(
-        reply_to,
-        do_resync(
-          state.session,
-          state.index,
-          torrent_hash,
-          piece_hash,
-          new_absolute_path,
-        ),
-      )
+      let #(result, state) =
+        resync_with_retry(state, torrent_hash, piece_hash, new_absolute_path, 1)
+      process.send(reply_to, result)
       actor.continue(state)
     }
     Shutdown -> actor.stop()
   }
 }
 
-pub fn fetch_index(session: Session) -> Index {
-  case qbittorrent.list_torrents(session) {
-    Error(_reason) -> {
-      logging.log(logging.Warning, "could not list torrents from qBittorrent")
-      empty_index()
+/// Runs `action` against the current session, transparently re-authenticating
+/// on a session-expired response and retrying with backoff on a connection
+/// failure — up to `max_retries` times — instead of surfacing the first
+/// failure straight to the caller. Returns the possibly-updated state
+/// (a fresh session after re-authenticating) alongside the result.
+fn with_retry(
+  state: IndexState,
+  action: fn(Session) -> Result(a, qbittorrent.QbittorrentError),
+) -> #(Result(a, qbittorrent.QbittorrentError), IndexState) {
+  attempt(state, action, 1)
+}
+
+fn attempt(
+  state: IndexState,
+  action: fn(Session) -> Result(a, qbittorrent.QbittorrentError),
+  attempt_number: Int,
+) -> #(Result(a, qbittorrent.QbittorrentError), IndexState) {
+  case action(state.session) {
+    Ok(value) -> #(Ok(value), state)
+    Error(qbittorrent.UnexpectedStatus(403, _))
+      if attempt_number <= max_retries
+    -> {
+      logging.log(
+        logging.Warning,
+        "qBittorrent session expired, re-authenticating (attempt "
+          <> int.to_string(attempt_number)
+          <> ")",
+      )
+      case qbittorrent.login(state.credentials) {
+        Ok(new_session) ->
+          attempt(
+            IndexState(..state, session: new_session),
+            action,
+            attempt_number + 1,
+          )
+        Error(login_error) -> #(Error(login_error), state)
+      }
     }
-    Ok(summaries) ->
-      summaries
-      |> list.filter_map(fn(summary) { fetch_entry(session, summary) })
-      |> build_index
+    Error(reason) if attempt_number <= max_retries -> {
+      case is_connection_error(reason) {
+        False -> #(Error(reason), state)
+        True -> {
+          let delay_ms = backoff_delay_ms(attempt_number)
+          logging.log(
+            logging.Warning,
+            "qBittorrent unreachable, retrying in "
+              <> int.to_string(delay_ms)
+              <> "ms (attempt "
+              <> int.to_string(attempt_number)
+              <> "): "
+              <> string.inspect(reason),
+          )
+          process.sleep(delay_ms)
+          attempt(state, action, attempt_number + 1)
+        }
+      }
+    }
+    Error(reason) -> #(Error(reason), state)
   }
+}
+
+/// RequestFailed is gleam_httpc's own typed connection errors (refused,
+/// timed out, TLS failure). ConnectionLost is the fallback for httpc-level
+/// errors gleam_httpc doesn't normalise into a Result at all — see
+/// QbittorrentError's ConnectionLost doc comment. Both are worth retrying;
+/// a 403 (session expired) is handled separately, by re-authenticating.
+fn is_connection_error(reason: qbittorrent.QbittorrentError) -> Bool {
+  case reason {
+    qbittorrent.RequestFailed(_) -> True
+    qbittorrent.ConnectionLost(_) -> True
+    _ -> False
+  }
+}
+
+fn backoff_delay_ms(attempt_number: Int) -> Int {
+  // 1s, 2s, 4s
+  1000 * int.bitwise_shift_left(1, attempt_number - 1)
+}
+
+pub fn fetch_index(session: Session) -> Index {
+  fetch_index_result(session) |> result.unwrap(empty_index())
+}
+
+fn fetch_index_result(
+  session: Session,
+) -> Result(Index, qbittorrent.QbittorrentError) {
+  use summaries <- result.try(qbittorrent.list_torrents(session))
+  summaries
+  |> list.filter_map(fn(summary) { fetch_entry(session, summary) })
+  |> build_index
+  |> Ok
 }
 
 fn fetch_entry(
@@ -323,6 +433,74 @@ fn do_resync(
 
   qbittorrent.recheck(session, torrent_hash)
   |> result.map_error(QbittorrentFailure)
+}
+
+fn resync_with_retry(
+  state: IndexState,
+  torrent_hash: String,
+  piece_hash: String,
+  new_absolute_path: String,
+  attempt_number: Int,
+) -> #(Result(Nil, ResyncError), IndexState) {
+  case
+    do_resync(
+      state.session,
+      state.index,
+      torrent_hash,
+      piece_hash,
+      new_absolute_path,
+    )
+  {
+    Error(QbittorrentFailure(qbittorrent.UnexpectedStatus(403, _)))
+      if attempt_number <= max_retries
+    -> {
+      logging.log(
+        logging.Warning,
+        "qBittorrent session expired during resync, re-authenticating (attempt "
+          <> int.to_string(attempt_number)
+          <> ")",
+      )
+      case qbittorrent.login(state.credentials) {
+        Ok(new_session) ->
+          resync_with_retry(
+            IndexState(..state, session: new_session),
+            torrent_hash,
+            piece_hash,
+            new_absolute_path,
+            attempt_number + 1,
+          )
+        Error(login_error) -> #(Error(QbittorrentFailure(login_error)), state)
+      }
+    }
+    Error(QbittorrentFailure(reason)) as error_result
+      if attempt_number <= max_retries
+    -> {
+      case is_connection_error(reason) {
+        False -> #(error_result, state)
+        True -> {
+          let delay_ms = backoff_delay_ms(attempt_number)
+          logging.log(
+            logging.Warning,
+            "qBittorrent unreachable during resync, retrying in "
+              <> int.to_string(delay_ms)
+              <> "ms (attempt "
+              <> int.to_string(attempt_number)
+              <> "): "
+              <> string.inspect(reason),
+          )
+          process.sleep(delay_ms)
+          resync_with_retry(
+            state,
+            torrent_hash,
+            piece_hash,
+            new_absolute_path,
+            attempt_number + 1,
+          )
+        }
+      }
+    }
+    result -> #(result, state)
+  }
 }
 
 @internal

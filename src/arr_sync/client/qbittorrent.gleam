@@ -19,6 +19,14 @@ pub type Session {
 
 pub type QbittorrentError {
   RequestFailed(httpc.HttpError)
+  // gleam_httpc doesn't normalise every httpc-level error into a typed
+  // Result — some (e.g. socket_closed_remotely, seen live when qBittorrent
+  // restarts mid-request) raise an uncaught Erlang exception instead. Every
+  // HTTP call in this module goes through safe_call, which catches that and
+  // surfaces it here instead of crashing the caller (the torrent_index
+  // actor, which would otherwise crash-loop the whole daemon past its
+  // supervisor's restart budget — verified live).
+  ConnectionLost(String)
   InvalidUrl(String)
   AuthenticationRejected(status: Int, body: String)
   MissingSessionCookie
@@ -44,24 +52,26 @@ pub fn login(credentials: Credentials) -> Result(Session, QbittorrentError) {
     |> request.set_header("content-type", "application/x-www-form-urlencoded")
     |> request.set_body(body)
 
-  use http_http_responseonse <- result.try(
-    httpc.send(http_request) |> result.map_error(RequestFailed),
+  use http_response <- result.try(
+    safe_call(fn() {
+      httpc.send(http_request) |> result.map_error(RequestFailed)
+    }),
   )
 
   // Older qBittorrent returns 200 with a "Ok."/"Fails." body; 5.x returns
   // 204 with no body — verified against a live 5.2.2 container.
-  case http_http_responseonse.status {
-    200 | 204 -> extract_session(credentials.url, http_http_responseonse)
-    status -> Error(AuthenticationRejected(status, http_http_responseonse.body))
+  case http_response.status {
+    200 | 204 -> extract_session(credentials.url, http_response)
+    status -> Error(AuthenticationRejected(status, http_response.body))
   }
 }
 
 fn extract_session(
   base_url: String,
-  http_http_responseonse: Response(String),
+  http_response: Response(String),
 ) -> Result(Session, QbittorrentError) {
   use set_cookie <- result.try(
-    response.get_header(http_http_responseonse, "set-cookie")
+    response.get_header(http_response, "set-cookie")
     |> result.replace_error(MissingSessionCookie),
   )
 
@@ -77,8 +87,8 @@ fn extract_session(
 pub fn list_torrents(
   session: Session,
 ) -> Result(List(TorrentSummary), QbittorrentError) {
-  use http_http_responseonse <- result.try(get(session, "/api/v2/torrents/info"))
-  decode_body(http_http_responseonse, decode.list(torrent_summary_decoder()))
+  use http_response <- result.try(get(session, "/api/v2/torrents/info"))
+  decode_body(http_response, decode.list(torrent_summary_decoder()))
 }
 
 /// GET /api/v2/torrents/files
@@ -86,14 +96,11 @@ pub fn torrent_files(
   session: Session,
   torrent_hash: String,
 ) -> Result(List(RemoteTorrentFile), QbittorrentError) {
-  use http_http_responseonse <- result.try(get(
+  use http_response <- result.try(get(
     session,
     "/api/v2/torrents/files?hash=" <> uri.percent_encode(torrent_hash),
   ))
-  decode_body(
-    http_http_responseonse,
-    decode.list(remote_torrent_file_decoder()),
-  )
+  decode_body(http_response, decode.list(remote_torrent_file_decoder()))
 }
 
 /// GET /api/v2/torrents/properties — piece_size isn't in torrents/info,
@@ -102,11 +109,11 @@ pub fn properties(
   session: Session,
   torrent_hash: String,
 ) -> Result(TorrentProperties, QbittorrentError) {
-  use http_http_responseonse <- result.try(get(
+  use http_response <- result.try(get(
     session,
     "/api/v2/torrents/properties?hash=" <> uri.percent_encode(torrent_hash),
   ))
-  decode_body(http_http_responseonse, properties_decoder())
+  decode_body(http_response, properties_decoder())
 }
 
 /// GET /api/v2/torrents/pieceHashes — the key to matching
@@ -114,11 +121,11 @@ pub fn piece_hashes(
   session: Session,
   torrent_hash: String,
 ) -> Result(List(String), QbittorrentError) {
-  use http_http_responseonse <- result.try(get(
+  use http_response <- result.try(get(
     session,
     "/api/v2/torrents/pieceHashes?hash=" <> uri.percent_encode(torrent_hash),
   ))
-  decode_body(http_http_responseonse, decode.list(decode.string))
+  decode_body(http_response, decode.list(decode.string))
 }
 
 /// POST /api/v2/torrents/setLocation — moves the torrent to a different
@@ -278,19 +285,26 @@ fn authenticated_request(
 fn send(
   http_request: Request(String),
 ) -> Result(Response(String), QbittorrentError) {
-  use http_http_responseonse <- result.try(
-    httpc.send(http_request) |> result.map_error(RequestFailed),
+  use http_response <- result.try(
+    safe_call(fn() {
+      httpc.send(http_request) |> result.map_error(RequestFailed)
+    }),
   )
-  case http_http_responseonse.status {
-    200 -> Ok(http_http_responseonse)
-    status -> Error(UnexpectedStatus(status, http_http_responseonse.body))
+  case http_response.status {
+    200 -> Ok(http_response)
+    status -> Error(UnexpectedStatus(status, http_response.body))
   }
 }
 
+@external(erlang, "arr_sync_qbittorrent_ffi", "safe_call")
+fn safe_call(
+  thunk: fn() -> Result(a, QbittorrentError),
+) -> Result(a, QbittorrentError)
+
 fn decode_body(
-  http_http_responseonse: Response(String),
+  http_response: Response(String),
   decoder: decode.Decoder(a),
 ) -> Result(a, QbittorrentError) {
-  json.parse(http_http_responseonse.body, decoder)
+  json.parse(http_response.body, decoder)
   |> result.map_error(DecodeFailed)
 }
