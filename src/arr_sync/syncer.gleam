@@ -8,6 +8,7 @@ import gleam/erlang/process.{type Subject}
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
+import simplifile
 
 pub type Message {
   HandleFsEvent(FsEvent)
@@ -63,9 +64,18 @@ fn handle_message(
 fn handle_fs_event(state: SyncerState, fs_event: FsEvent) -> Nil {
   case fs_event {
     fs_watcher.Deleted(_) -> Nil
-    fs_watcher.Created(path)
-    | fs_watcher.Renamed(_, path)
-    | fs_watcher.Moved(_, path) -> resync(state, path)
+    fs_watcher.Created(path) -> resync_if_large_enough(state, path)
+  }
+}
+
+/// Sidecar files (subtitles, .nfo, thumbnails) fire the same Created event
+/// as the media file itself, but are never worth piece-hashing — this skips
+/// them cheaply with a single stat call before any hashing happens.
+fn resync_if_large_enough(state: SyncerState, path: String) -> Nil {
+  let min_size_bytes = state.config.sync.min_file_size_mb * 1_048_576
+  case simplifile.file_info(path) {
+    Ok(info) if info.size >= min_size_bytes -> resync(state, path)
+    _ -> Nil
   }
 }
 

@@ -12,7 +12,7 @@ pub type StatusReport {
 
 pub type DistributionError {
   CookieFileError(simplifile.FileError)
-  PermissionsError(String)
+  CookieWriteError(String)
   StartFailed(String)
   DaemonUnreachable
   RpcFailed(String)
@@ -37,14 +37,16 @@ pub fn load_or_create_cookie() -> Result(String, DistributionError) {
 }
 
 fn create_cookie() -> Result(String, DistributionError) {
-  let cookie = random_cookie()
   use _ <- result.try(
-    simplifile.write(cookie_file, cookie) |> result.map_error(CookieFileError),
+    write_cookie_if_absent(cookie_file, random_cookie())
+    |> result.map_error(CookieWriteError),
   )
-  use _ <- result.try(
-    restrict_permissions(cookie_file) |> result.map_error(PermissionsError),
-  )
-  Ok(cookie)
+  // Another process may have won the race to create the file first, with a
+  // different cookie than the one generated above — read back whatever
+  // ended up on disk so every process agrees on the same cookie.
+  simplifile.read(cookie_file)
+  |> result.map(string.trim)
+  |> result.map_error(CookieFileError)
 }
 
 /// Turns the current node into a distributed one, so it can be reached (as
@@ -92,8 +94,8 @@ pub fn node_name() -> String
 @external(erlang, "arr_sync_distribution_ffi", "ping")
 fn ping(node_name: String) -> Bool
 
-@external(erlang, "arr_sync_distribution_ffi", "restrict_permissions")
-fn restrict_permissions(path: String) -> Result(Nil, String)
+@external(erlang, "arr_sync_distribution_ffi", "write_cookie_if_absent")
+fn write_cookie_if_absent(path: String, content: String) -> Result(Nil, String)
 
 @external(erlang, "arr_sync_distribution_ffi", "random_cookie")
 fn random_cookie() -> String

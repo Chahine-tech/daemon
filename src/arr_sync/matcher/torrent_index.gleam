@@ -73,6 +73,7 @@ type IndexState {
     session: Session,
     index: Index,
     self: Subject(Message),
+    recheck_delay_seconds: Int,
   )
 }
 
@@ -87,6 +88,7 @@ const max_retries = 3
 
 pub fn start(
   credentials: qbittorrent.Credentials,
+  recheck_delay_seconds: Int,
   name: process.Name(Message),
 ) -> actor.StartResult(Subject(Message)) {
   actor.new_with_initialiser(15_000, fn(subject) {
@@ -102,6 +104,7 @@ pub fn start(
           session:,
           index:,
           self: subject,
+          recheck_delay_seconds:,
         ))
         |> actor.returning(subject)
         |> Ok
@@ -161,7 +164,14 @@ fn handle_message(
     }
     Resync(torrent_hash, piece_hash, new_absolute_path, reply_to) -> {
       let #(result, state) =
-        resync_with_retry(state, torrent_hash, piece_hash, new_absolute_path, 1)
+        resync_with_retry(
+          state,
+          torrent_hash,
+          piece_hash,
+          new_absolute_path,
+          state.recheck_delay_seconds,
+          1,
+        )
       process.send(reply_to, result)
       actor.continue(state)
     }
@@ -402,6 +412,7 @@ fn do_resync(
   torrent_hash: String,
   piece_hash: String,
   new_absolute_path: String,
+  recheck_delay_seconds: Int,
 ) -> Result(Nil, ResyncError) {
   use #(entry, file) <- result.try(
     resolve(index, torrent_hash, piece_hash)
@@ -431,6 +442,11 @@ fn do_resync(
     |> result.map_error(QbittorrentFailure),
   )
 
+  // Give qBittorrent a moment to settle the rename on its side before
+  // forcing a recheck — configurable since how long that takes depends on
+  // torrent size and disk speed.
+  process.sleep(recheck_delay_seconds * 1000)
+
   qbittorrent.recheck(session, torrent_hash)
   |> result.map_error(QbittorrentFailure)
 }
@@ -440,6 +456,7 @@ fn resync_with_retry(
   torrent_hash: String,
   piece_hash: String,
   new_absolute_path: String,
+  recheck_delay_seconds: Int,
   attempt_number: Int,
 ) -> #(Result(Nil, ResyncError), IndexState) {
   case
@@ -449,6 +466,7 @@ fn resync_with_retry(
       torrent_hash,
       piece_hash,
       new_absolute_path,
+      recheck_delay_seconds,
     )
   {
     Error(QbittorrentFailure(qbittorrent.UnexpectedStatus(403, _)))
@@ -467,6 +485,7 @@ fn resync_with_retry(
             torrent_hash,
             piece_hash,
             new_absolute_path,
+            recheck_delay_seconds,
             attempt_number + 1,
           )
         Error(login_error) -> #(Error(QbittorrentFailure(login_error)), state)
@@ -494,6 +513,7 @@ fn resync_with_retry(
             torrent_hash,
             piece_hash,
             new_absolute_path,
+            recheck_delay_seconds,
             attempt_number + 1,
           )
         }

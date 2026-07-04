@@ -20,6 +20,12 @@ naruto.s01e01.xvid.mp4  →  Naruto (2002)/Season 01/Naruto - S01E01 - Enter Nar
 
 qBittorrent loses track of the file, seeding stops, peers are lost, your ratio evaporates. `arr-sync` gets rid of that: it detects the rename, finds the right torrent by **BitTorrent piece hash** (not by filename), and fixes qBittorrent on its own.
 
+### Why not just hardlink instead?
+
+A common workaround: have Sonarr/Radarr **hardlink** the renamed file into the media library instead of moving it, so the file qBittorrent is seeding never actually moves. Works, but only if downloads and media share the **same filesystem** (hardlinks can't cross filesystem/volume boundaries — separate Docker mounts break this), and qBittorrent keeps reporting the original, un-renamed filename forever.
+
+`arr-sync` covers the general case: it works across filesystems/volumes/network shares, and qBittorrent ends up reporting the file's actual current path and name. If hardlinking already works for your setup, you probably don't need it.
+
 ---
 
 ## How it works
@@ -74,18 +80,25 @@ Module names are global across the whole BEAM, so both layers are namespaced to 
 brew install gleam erlang    # or your package manager of choice
 gleam deps download
 cp arr-sync.toml.example arr-sync.toml    # fill in your qBittorrent credentials
+make build                                # export the standalone OTP release into build/erlang-shipment
 ```
+
+Re-run `make build` whenever the code changes — the other `make` targets run whatever was last built, they don't rebuild on their own.
 
 ## Usage
 
 ```sh
-arr-sync start                                 # run the full daemon
-arr-sync start --config path/to/config.toml
-arr-sync match /data/media/Show/episode.mkv    # test matching without touching qBittorrent
-arr-sync list                                  # list indexed torrents
-arr-sync resync <torrent_hash>                 # force a qBittorrent recheck
-arr-sync status                                # query a running daemon (torrents indexed, piece sizes seen)
+make start                              # run the full daemon
+make start CONFIG=path/to/config.toml
+make match FILE=/data/media/Show/episode.mkv    # test matching without touching qBittorrent
+make list                               # list indexed torrents
+make resync HASH=<torrent_hash>         # force a qBittorrent recheck
+make status                             # query a running daemon (torrents indexed, piece sizes seen)
+make run ARGS="..."                     # anything not covered by the targets above
+make help                               # list all targets
 ```
+
+Every target runs the exported `build/erlang-shipment/entrypoint.sh` (a standalone OTP release — no `gleam` toolchain needed at runtime) with the `ERL_FLAGS` needed to avoid the boot-crash risk described below. Calling `build/erlang-shipment/entrypoint.sh` directly bypasses that — don't.
 
 ## Config
 
@@ -95,7 +108,7 @@ arr-sync status                                # query a running daemon (torrent
 |---|---|---|
 | `[qbittorrent]` | `url`, `username`, `password` | qBittorrent WebUI |
 | `[watch]` | `paths` | Watched directories |
-| `[sync]` | `recheck_delay`, `min_file_size_mb` | Resync tuning |
+| `[sync]` | `recheck_delay`, `min_file_size_mb` | Seconds to wait after `renameFile` before forcing a `recheck`; minimum file size (MB) before a Created event is worth hashing at all, to skip sidecar files (subtitles, `.nfo`, thumbnails) |
 | `[sonarr]` *(optional)* | `url`, `api_key` | Post-resync notification |
 | `[radarr]` *(optional)* | `url`, `api_key` | Post-resync notification |
 
@@ -107,15 +120,21 @@ arr-sync status                                # query a running daemon (torrent
 
 **Not checked against a live instance**: Sonarr/Radarr notifications (HTTP client only, same shape as the qBittorrent one).
 
-### qBittorrent API quirks
+---
 
-Worth knowing if you're touching `client/qbittorrent.gleam`:
+## Gotchas
 
-- Login replies **204** on success on qBittorrent 5.x, not 200
-- `progress` can be a bare JSON integer (`1`) instead of a float (`1.0`) once a file is complete
-- `piece_size` isn't in `torrents/info`, only in `torrents/properties`
-- `setLocation` alone doesn't fix a rename — without `renameFile`, the torrent drops to 0% instead of resyncing
-- `torrents/files` includes a `piece_range` per file, which avoids computing cumulative file offsets by hand
+### Path resolution gotcha: `/tmp` vs `/private/tmp` on macOS
+
+On macOS, `/tmp` is a symlink to `/private/tmp`, and FSEvents always reports the **resolved** path — `fs_watcher` sees `/private/tmp/...` even if the file lives under `/tmp/...`. If qBittorrent's `save_path` for a torrent was set using the unresolved `/tmp/...` form (e.g. that's what was passed when the torrent was added), `relative_to` in `torrent_index.gleam` compares two paths that look different but point at the same file, the match fails, and the resync silently no-ops.
+
+Not an `arr-sync` bug — FSEvents and qBittorrent simply don't agree on symlink resolution. Keep `[watch] paths` and qBittorrent's save paths on the same resolved form (`/private/tmp/...`), or better, avoid `/tmp` for real deployments entirely — it's wiped on reboot anyway, `/data/media` or similar is the right call.
+
+### Boot-crash risk: `fs`'s native binary is missing
+
+`fs` (the filesystem-watcher dependency) auto-starts as an OTP application dependency — `application:ensure_all_started('arr_sync')` starts it before `main/0` runs, outside `arr_sync_fs_watcher_ffi`'s own error handling. If the native watcher binary for the current OS is missing, its default `backwards_compatible` mode still tries to auto-spawn one at boot and crashes the whole VM, not just one watch path.
+
+The `Makefile` sets `ERL_FLAGS="-fs backwards_compatible false"` before running the exported release to disable that auto-spawn — arr-sync's own per-path watchers (`fs_watcher.gleam`) start explicitly afterwards and already handle a missing binary cleanly (logged, not fatal). Calling `build/erlang-shipment/entrypoint.sh` directly bypasses this — don't.
 
 ### `arr-sync status`
 
@@ -125,10 +144,6 @@ Gotcha found while wiring this up: use `inet:gethostname()`, not `net_adm:localh
 
 ---
 
-## Development
+## Contributing
 
-```sh
-gleam test               # 25 tests, no network required
-gleam format --check
-docker compose up -d     # disposable qBittorrent to retest the HTTP client for real
-```
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for dev setup, running tests, and implementation-level gotchas.

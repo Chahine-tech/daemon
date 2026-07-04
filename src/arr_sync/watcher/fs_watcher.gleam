@@ -1,3 +1,4 @@
+import arr_sync/logging
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Subject}
 import gleam/int
@@ -7,8 +8,6 @@ import gleam/otp/actor
 
 pub type FsEvent {
   Created(path: String)
-  Renamed(from: String, to: String)
-  Moved(from: String, to: String)
   Deleted(path: String)
 }
 
@@ -27,7 +26,16 @@ pub fn start(
   name: process.Name(Message),
 ) -> actor.StartResult(Subject(Message)) {
   actor.new_with_initialiser(1000, fn(subject) {
-    list.index_map(paths, fn(path, index) { watch(int.to_string(index), path) })
+    list.index_map(paths, fn(path, index) {
+      case watch(int.to_string(index), path) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          // Loud on purpose: a path that silently isn't watched means
+          // renames under it will never trigger a resync, with nothing in
+          // the logs to explain why.
+          logging.log(logging.Error, "not watching " <> path <> ": " <> reason)
+      }
+    })
 
     let selector =
       process.new_selector()
@@ -98,7 +106,7 @@ pub fn classify(path: String, flags: List(String)) -> option.Option(FsEvent) {
 }
 
 @external(erlang, "arr_sync_fs_watcher_ffi", "watch")
-fn watch(name: String, path: String) -> Nil
+fn watch(name: String, path: String) -> Result(Nil, String)
 
 @external(erlang, "arr_sync_fs_watcher_ffi", "decode_raw_event")
 fn decode_raw_event(raw: Dynamic) -> Result(#(String, List(String)), Nil)

@@ -66,7 +66,11 @@ fn start(config_path: String) -> Nil {
         )
         |> supervisor.add(
           supervision.worker(fn() {
-            torrent_index.start(credentials, index_name)
+            torrent_index.start(
+              credentials,
+              loaded_config.sync.recheck_delay_seconds,
+              index_name,
+            )
           })
           |> supervision.timeout(ms: 20_000),
         )

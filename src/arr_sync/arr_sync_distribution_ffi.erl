@@ -1,6 +1,6 @@
 -module(arr_sync_distribution_ffi).
 -export([fixed_name/1, ensure_started/2, hostname/0, node_name/0, ping/1,
-         restrict_permissions/1, random_cookie/0, os_pid/0, rpc_query_status/2]).
+         write_cookie_if_absent/2, random_cookie/0, os_pid/0, rpc_query_status/2]).
 
 %% Deterministic Name(msg) (no random suffix, unlike gleam_erlang's
 %% process.new_name/1) so a function invoked over RPC by a separate node
@@ -16,8 +16,7 @@ ensure_started(ShortName, Cookie) ->
     case net_kernel:get_state() of
         #{started := no} ->
             os:cmd("epmd -daemon"),
-            timer:sleep(300),
-            case net_kernel:start([binary_to_atom(ShortName, utf8), shortnames]) of
+            case start_distribution(binary_to_atom(ShortName, utf8), 20) of
                 {ok, _Pid} ->
                     erlang:set_cookie(binary_to_atom(Cookie, utf8)),
                     {ok, nil};
@@ -27,6 +26,24 @@ ensure_started(ShortName, Cookie) ->
         _Started ->
             erlang:set_cookie(binary_to_atom(Cookie, utf8)),
             {ok, nil}
+    end.
+
+%% epmd was just spawned above via os:cmd and may not be listening on its
+%% port yet — net_kernel:start fails with {'EXIT', nodistribution} deep in
+%% its error tuple until it is. Rather than pattern-match that shape (liable
+%% to shift across OTP versions) or guess a single fixed delay, retry with a
+%% short backoff up to ~0.5s, which resolves in 1-2 iterations in practice
+%% and copes better than a blind sleep when epmd is slow to bind (e.g. a
+%% loaded CI runner).
+start_distribution(Name, Retries) ->
+    case net_kernel:start([Name, shortnames]) of
+        {ok, Pid} ->
+            {ok, Pid};
+        {error, Reason} when Retries =< 0 ->
+            {error, Reason};
+        {error, _Reason} ->
+            timer:sleep(25),
+            start_distribution(Name, Retries - 1)
     end.
 
 %% inet:gethostname/0, not net_adm:localhost/0 — the latter appends mDNS
@@ -42,11 +59,36 @@ node_name() ->
 ping(NodeName) ->
     net_adm:ping(binary_to_atom(NodeName, utf8)) =:= pong.
 
-restrict_permissions(Path) ->
-    case file:change_mode(binary_to_list(Path), 8#600) of
-        ok -> {ok, nil};
+%% Writes Content to Path only if Path doesn't already exist, atomically —
+%% closing the race where two processes (e.g. `arr-sync start` and a
+%% concurrent `arr-sync status`) both see the cookie file missing and both
+%% try to create it. Writes to a per-process temp file (already chmod'd
+%% 0600, so the permission never differs from what ends up under Path) then
+%% claims Path with a hard link, which POSIX guarantees fails with EEXIST if
+%% another process's link won the race first — in which case this one's
+%% content is simply discarded and the caller re-reads whatever is on disk.
+write_cookie_if_absent(Path, Content) ->
+    PathList = binary_to_list(Path),
+    Tmp = PathList ++ "." ++ os:getpid() ++ ".tmp",
+    case file:write_file(Tmp, Content) of
+        ok -> claim_path(Tmp, PathList);
         {error, Reason} -> {error, format_error(Reason)}
     end.
+
+claim_path(Tmp, PathList) ->
+    Result =
+        case file:change_mode(Tmp, 8#600) of
+            ok ->
+                case file:make_link(Tmp, PathList) of
+                    ok -> {ok, nil};
+                    {error, eexist} -> {ok, nil};
+                    {error, Reason} -> {error, format_error(Reason)}
+                end;
+            {error, Reason} ->
+                {error, format_error(Reason)}
+        end,
+    file:delete(Tmp),
+    Result.
 
 random_cookie() ->
     string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(24))).

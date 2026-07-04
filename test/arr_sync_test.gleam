@@ -272,10 +272,3 @@ pub fn config_load_fails_on_missing_required_field_test() {
   let assert Error(config.InvalidField(_reason)) =
     config.load("test/fixtures/missing_field_config.toml")
 }
-
-pub fn hello_world_test() {
-  let name = "Joe"
-  let greeting = "Hello, " <> name <> "!"
-
-  assert greeting == "Hello, Joe!"
-}
