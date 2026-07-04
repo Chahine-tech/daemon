@@ -116,13 +116,17 @@ Every target runs the exported `build/erlang-shipment/entrypoint.sh` (a standalo
 
 ## Status
 
-**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent, `arr-sync start` booting the full daemon, `arr-sync status` querying it live from a separate process.
+**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent, `arr-sync start` booting the full daemon, `arr-sync status` querying it live from a separate process (including the resync success/failure counters — both a real resync failure and a real success were triggered and observed via `status`), hybrid (v1+v2) BitTorrent torrents matching correctly out of the box.
 
 **Not checked against a live instance**: Sonarr/Radarr notifications (HTTP client only, same shape as the qBittorrent one).
 
 ---
 
 ## Gotchas
+
+### Pure BitTorrent v2 torrents can't be matched
+
+Hybrid (v1+v2) torrents work with no extra setup — qBittorrent reports their v1 SHA1 piece hashes unchanged. Pure v2-only torrents don't: qBittorrent's `pieceHashes` endpoint doesn't return real hashes for them (verified against 5.2.2 — it's raw bytes from the torrent's own metadata, not actual piece hashes, a qBittorrent/libtorrent bug we can't work around client-side). `arr-sync` detects this and skips indexing those torrents entirely rather than risk a bogus match, logging a warning instead. If your tracker requires pure v2 torrents specifically, `arr-sync` won't be able to resync them — hybrid works fine.
 
 ### Path resolution gotcha: `/tmp` vs `/private/tmp` on macOS
 

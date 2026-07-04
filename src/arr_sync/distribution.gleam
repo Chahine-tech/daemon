@@ -7,7 +7,12 @@ import simplifile
 const cookie_file = ".arr-sync-cookie"
 
 pub type StatusReport {
-  StatusReport(torrent_count: Int, piece_sizes: List(Int))
+  StatusReport(
+    torrent_count: Int,
+    piece_sizes: List(Int),
+    resync_success_count: Int,
+    resync_failure_count: Int,
+  )
 }
 
 pub type DistributionError {
@@ -66,6 +71,8 @@ pub fn query_status() -> StatusReport {
   StatusReport(
     torrent_count: status.torrent_count,
     piece_sizes: status.piece_sizes,
+    resync_success_count: status.resync_success_count,
+    resync_failure_count: status.resync_failure_count,
   )
 }
 

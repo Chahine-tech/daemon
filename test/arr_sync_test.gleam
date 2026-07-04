@@ -47,10 +47,22 @@ pub fn remote_torrent_file_decoder_accepts_float_progress_test() {
 
 pub fn properties_decoder_parses_a_real_properties_response_test() {
   // Captured live: piece_size lives here, not in torrents/info.
-  let body = "{\"piece_size\":32768,\"pieces_num\":2}"
+  let body =
+    "{\"piece_size\":32768,\"pieces_num\":2,\"infohash_v1\":\"172274958c72543657e80417f44785921483c743\"}"
 
   let assert Ok(properties) = json.parse(body, qbittorrent.properties_decoder())
   assert properties.piece_size == 32_768
+  assert properties.infohash_v1 == "172274958c72543657e80417f44785921483c743"
+}
+
+pub fn properties_decoder_parses_an_empty_infohash_v1_test() {
+  // Captured live from a pure BitTorrent v2 torrent (qBittorrent 5.2.2):
+  // infohash_v1 is "" — the signal torrent_index uses to skip a torrent
+  // whose pieceHashes qBittorrent can't actually report correctly.
+  let body = "{\"piece_size\":65536,\"pieces_num\":32,\"infohash_v1\":\"\"}"
+
+  let assert Ok(properties) = json.parse(body, qbittorrent.properties_decoder())
+  assert properties.infohash_v1 == ""
 }
 
 fn sample_entry(

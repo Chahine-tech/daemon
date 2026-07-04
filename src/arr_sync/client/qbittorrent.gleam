@@ -204,7 +204,9 @@ pub type RemoteTorrentFile {
 }
 
 pub type TorrentProperties {
-  TorrentProperties(piece_size: Int)
+  // infohash_v1 is "" for a pure BitTorrent v2 torrent — see
+  // properties_decoder's doc comment for why that matters here.
+  TorrentProperties(piece_size: Int, infohash_v1: String)
 }
 
 @internal
@@ -239,10 +241,23 @@ fn piece_range_decoder() -> decode.Decoder(#(Int, Int)) {
   }
 }
 
+/// infohash_v1 is empty for a pure BitTorrent v2 torrent, non-empty for a v1
+/// or hybrid (v1+v2) one. Verified live against qBittorrent 5.2.2: for a
+/// hybrid torrent, `torrents/pieceHashes` returns its v1 SHA1 hashes
+/// unchanged (byte-identical to a plain v1 torrent of the same content) —
+/// already matched correctly by the existing SHA1 piece hasher, no v2-
+/// specific code needed. For a pure v2 torrent, `torrents/pieceHashes`
+/// doesn't return real hashes at all: it returns the raw bencoded bytes of
+/// the torrent's own `info` dict, sliced into 20-byte chunks and hex-encoded
+/// as if they were SHA1 hashes (confirmed by decoding the hex — it's
+/// literally `d9:file treed13:...`, the info dict's own bencode). This
+/// field is how torrent_index tells the two cases apart and skips the
+/// latter instead of indexing garbage.
 @internal
 pub fn properties_decoder() -> decode.Decoder(TorrentProperties) {
   use piece_size <- decode.field("piece_size", decode.int)
-  decode.success(TorrentProperties(piece_size:))
+  use infohash_v1 <- decode.field("infohash_v1", decode.string)
+  decode.success(TorrentProperties(piece_size:, infohash_v1:))
 }
 
 fn get(

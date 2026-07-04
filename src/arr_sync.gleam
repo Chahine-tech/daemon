@@ -137,7 +137,12 @@ fn show_status() -> Nil {
                 "daemon reachable — "
                   <> int.to_string(status.torrent_count)
                   <> " torrents indexed, piece sizes seen: "
-                  <> string.inspect(status.piece_sizes),
+                  <> string.inspect(status.piece_sizes)
+                  <> ", resyncs: "
+                  <> int.to_string(status.resync_success_count)
+                  <> " ok / "
+                  <> int.to_string(status.resync_failure_count)
+                  <> " failed",
               )
             Error(distribution.DaemonUnreachable) ->
               logging.log(

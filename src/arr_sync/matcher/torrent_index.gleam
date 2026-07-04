@@ -43,7 +43,12 @@ pub type ResyncError {
 }
 
 pub type IndexStatus {
-  IndexStatus(torrent_count: Int, piece_sizes: List(Int))
+  IndexStatus(
+    torrent_count: Int,
+    piece_sizes: List(Int),
+    resync_success_count: Int,
+    resync_failure_count: Int,
+  )
 }
 
 pub type Message {
@@ -74,6 +79,8 @@ type IndexState {
     index: Index,
     self: Subject(Message),
     recheck_delay_seconds: Int,
+    resync_success_count: Int,
+    resync_failure_count: Int,
   )
 }
 
@@ -105,6 +112,8 @@ pub fn start(
           index:,
           self: subject,
           recheck_delay_seconds:,
+          resync_success_count: 0,
+          resync_failure_count: 0,
         ))
         |> actor.returning(subject)
         |> Ok
@@ -158,6 +167,8 @@ fn handle_message(
         IndexStatus(
           torrent_count: dict.size(state.index.torrents),
           piece_sizes: piece_sizes(state.index),
+          resync_success_count: state.resync_success_count,
+          resync_failure_count: state.resync_failure_count,
         ),
       )
       actor.continue(state)
@@ -172,6 +183,18 @@ fn handle_message(
           state.recheck_delay_seconds,
           1,
         )
+      let state = case result {
+        Ok(Nil) ->
+          IndexState(
+            ..state,
+            resync_success_count: state.resync_success_count + 1,
+          )
+        Error(_) ->
+          IndexState(
+            ..state,
+            resync_failure_count: state.resync_failure_count + 1,
+          )
+      }
       process.send(reply_to, result)
       actor.continue(state)
     }
@@ -281,6 +304,19 @@ fn fetch_entry(
     qbittorrent.piece_hashes(session, summary.hash),
     qbittorrent.properties(session, summary.hash)
   {
+    Ok(_), Ok(_), Ok(properties) if properties.infohash_v1 == "" -> {
+      // Pure BitTorrent v2 torrent: qBittorrent doesn't expose real piece
+      // hashes for these (verified live against 5.2.2, see
+      // properties_decoder's doc comment) — indexing them would poison
+      // by_piece_hash with garbage entries under this torrent's hash.
+      logging.log(
+        logging.Warning,
+        "skipping torrent "
+          <> summary.hash
+          <> ": pure BitTorrent v2 torrent, qBittorrent does not expose usable piece hashes for it",
+      )
+      Error(Nil)
+    }
     Ok(files), Ok(piece_hashes), Ok(properties) ->
       Ok(TorrentEntry(
         hash: summary.hash,
