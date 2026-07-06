@@ -37,11 +37,11 @@ A common workaround: have Sonarr/Radarr **hardlink** the renamed file into the m
 |                               |                                   |
 |-------------------------- Created(path) -------------------------->
 |                               |                                   |
-                                |<----------- PieceSizes -----------|
-                                |--------- [32768, 262144] --------->
+                                |<------------ Probes --------------|
+                                |--- [(32768, sha1), (65536, v2)] -->
 |                               |                                   |
                                 (hash the file's first piece
-                                 for each candidate size)
+                                 for each candidate probe)
 |                               |                                   |
                                 |<---------- Lookup(hash) ----------|
                                 |-------- Matched(torrent) --------->
@@ -51,7 +51,7 @@ A common workaround: have Sonarr/Radarr **hardlink** the renamed file into the m
                                  on the qBittorrent side
 ```
 
-Matching is done via **BitTorrent piece hashes** (SHA1 of the 16 KB–4 MB chunks that make up the torrent, listed in the `.torrent`) — they never change as long as the file's content doesn't, unlike its name. If several torrents share the matched piece (the same content cross-seeded on multiple trackers), every one of them gets resynced. Resyncs run concurrently: a season-sized import doesn't queue behind the first file's recheck.
+Matching is done via **BitTorrent piece hashes** (SHA1 of the 16 KB–4 MB chunks that make up a v1 torrent, SHA256 merkle roots for v2 — see Gotchas) — they never change as long as the file's content doesn't, unlike its name. If several torrents share the matched piece (the same content cross-seeded on multiple trackers), every one of them gets resynced. Resyncs run concurrently: a season-sized import doesn't queue behind the first file's recheck.
 
 Files that don't start on a piece boundary (every file but the first in a v1 multi-file torrent without pad files — pieces don't align to file boundaries in v1) can't be matched by their first bytes, so matching falls back to exact file size, verified by hashing the file's first *fully contained* piece at its known offset inside the file. A file too small to fully contain any piece stays unmatchable — below the typical piece size, that's sidecar territory anyway.
 
@@ -64,15 +64,17 @@ Files that don't start on a piece boundary (every file but the first in a v1 mul
 | `arr_sync` | CLI (`start`/`match`/`list`/`resync`), OTP supervision tree |
 | `arr_sync/syncer` | Subscribes to the watcher, orchestrates matching + resync |
 | `arr_sync/matcher/torrent_index` | Actor holding the qBittorrent session + the `piece_hash → torrent` index, resolves piece → exact file, calls `renameFile`/`setLocation`/`recheck` |
-| `arr_sync/matcher/piece_hasher` | Hashes a file's first pieces without ever loading the whole thing into memory |
+| `arr_sync/matcher/piece_hasher` | Hashes a file's first pieces (flat SHA1 or BEP 52 SHA256 merkle) without ever loading the whole thing into memory |
+| `arr_sync/matcher/torrent_file` | Bencode parser for exported `.torrent` files — the source of real v2 piece hashes |
+| `arr_sync/paths` | Path mappings (qBittorrent's view ↔ the daemon's) + symlink canonicalization |
 | `arr_sync/watcher/fs_watcher` | Filesystem watcher (inotify/FSEvents/kqueue depending on the OS) |
 | `arr_sync/client/qbittorrent` | HTTP client for the qBittorrent WebUI API |
-| `arr_sync/client/sonarr` / `arr_sync/client/radarr` | Optional post-resync notifications |
+| `arr_sync/client/sonarr` / `arr_sync/client/radarr` | Optional post-resync library rescans |
 | `arr_sync/config` | Parses `arr-sync.toml` |
 | `arr_sync/logging` | RFC3339-timestamped logs |
 | `arr_sync/distribution` | Distributed Erlang so `arr-sync status` can query a running daemon from a separate process |
 
-Module names are global across the whole BEAM, so both layers are namespaced to avoid collisions with other packages: Gleam modules live under `arr_sync/` (matching the package name) instead of at the top of `src/`, and the two Erlang FFI shims (`arr_sync_piece_hasher_ffi.erl`, `arr_sync_fs_watcher_ffi.erl` — handling `file:pread`, `:crypto`, and the `:fs` lib, none of which Gleam or `gleam_stdlib` cover) are prefixed `arr_sync_` and colocated with the Gleam module that calls them.
+Module names are global across the whole BEAM, so both layers are namespaced to avoid collisions with other packages: Gleam modules live under `arr_sync/` (matching the package name) instead of at the top of `src/`, and the Erlang FFI shims (`arr_sync_*_ffi.erl` — handling `file:pread`, `:crypto`, symlink resolution, env vars, distribution, and the `:fs` lib, none of which Gleam or `gleam_stdlib` cover) are prefixed `arr_sync_` and colocated with the Gleam modules that call them.
 
 ---
 
@@ -89,7 +91,7 @@ services:
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD}
     volumes:
       - ./arr-sync.toml:/config/arr-sync.toml:ro
-      - /data/media:/data/media    # must be the SAME path qBittorrent sees
+      - /data/media:/data/media    # same path qBittorrent sees (or declare a path mapping)
 ```
 
 The one rule that matters: **arr-sync must be able to make sense of qBittorrent's paths**. Simplest way: mount the same volume at the same place in both containers. If the mounts differ (qBittorrent sees `/data/media`, arr-sync sees `/media`), declare it — exactly like Sonarr/Radarr's Remote Path Mappings:
