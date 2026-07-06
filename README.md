@@ -53,6 +53,8 @@ A common workaround: have Sonarr/Radarr **hardlink** the renamed file into the m
 
 Matching is done via **BitTorrent piece hashes** (SHA1 of the 16 KB–4 MB chunks that make up the torrent, listed in the `.torrent`) — they never change as long as the file's content doesn't, unlike its name. If several torrents share the matched piece (the same content cross-seeded on multiple trackers), every one of them gets resynced. Resyncs run concurrently: a season-sized import doesn't queue behind the first file's recheck.
 
+Files that don't start on a piece boundary (every file but the first in a v1 multi-file torrent without pad files — pieces don't align to file boundaries in v1) can't be matched by their first bytes, so matching falls back to exact file size, verified by hashing the file's first *fully contained* piece at its known offset inside the file. A file too small to fully contain any piece stays unmatchable — below the typical piece size, that's sidecar territory anyway.
+
 ---
 
 ## Architecture
@@ -116,7 +118,7 @@ Every target runs the exported `build/erlang-shipment/entrypoint.sh` (a standalo
 
 ## Status
 
-**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent, `arr-sync start` booting the full daemon, `arr-sync status` querying it live from a separate process (including the resync success/failure counters — both a real resync failure and a real success were triggered and observed via `status`), hybrid (v1+v2) BitTorrent torrents matching correctly out of the box, two files moved at once resyncing in parallel (`status` answered mid-flight), a cross-seeded file (two torrents, same content, different infohashes) resyncing both torrents.
+**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent, `arr-sync start` booting the full daemon, `arr-sync status` querying it live from a separate process (including the resync success/failure counters — both a real resync failure and a real success were triggered and observed via `status`), hybrid (v1+v2) BitTorrent torrents matching correctly out of the box, two files moved at once resyncing in parallel (`status` answered mid-flight), a cross-seeded file (two torrents, same content, different infohashes) resyncing both torrents, a non-piece-aligned interior file of a v1 multi-file torrent without pad files matching via the by-size fallback and resyncing.
 
 **Not checked against a live instance**: Sonarr/Radarr notifications (HTTP client only, same shape as the qBittorrent one).
 

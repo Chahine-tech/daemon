@@ -13,6 +13,7 @@ import gleam/list
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/string
+import simplifile
 
 /// Short node name the daemon registers under when distribution starts.
 /// The CLI's `status` command dials this same name to reach it.
@@ -224,7 +225,32 @@ fn report_match(path: String, index: torrent_index.Index) -> Nil {
         logging.Warning,
         path <> " matches multiple torrents: " <> string.join(candidates, ", "),
       )
-    Ok(torrent_index.NoMatch) | Error(Nil) ->
-      logging.log(logging.Info, "no torrent matches " <> path)
+    Ok(torrent_index.NoMatch) | Error(Nil) -> report_match_by_size(path, index)
+  }
+}
+
+// Same by-size fallback as the daemon's syncer, for files that don't start
+// on a piece boundary — see torrent_index.SizeCandidate.
+fn report_match_by_size(path: String, index: torrent_index.Index) -> Nil {
+  let verified = case simplifile.file_info(path) {
+    Error(_) -> []
+    Ok(info) ->
+      torrent_index.verify_size_candidates(
+        path,
+        torrent_index.size_candidates(index, info.size),
+      )
+  }
+  case verified {
+    [] -> logging.log(logging.Info, "no torrent matches " <> path)
+    candidates ->
+      list.each(candidates, fn(candidate) {
+        logging.log(
+          logging.Info,
+          path
+            <> " matches torrent "
+            <> candidate.torrent_hash
+            <> " (by size + interior piece)",
+        )
+      })
   }
 }

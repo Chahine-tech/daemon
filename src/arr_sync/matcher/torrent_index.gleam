@@ -77,6 +77,7 @@ pub type Message {
     session: Session,
   )
   Lookup(piece_hash: String, reply_to: Subject(MatchResult))
+  SizeCandidates(size: Int, reply_to: Subject(List(SizeCandidate)))
   PieceSizes(reply_to: Subject(List(Int)))
   Status(reply_to: Subject(IndexStatus))
   Resync(
@@ -94,10 +95,28 @@ pub type Message {
   Shutdown
 }
 
+/// Fallback probe for a file that doesn't start on a piece boundary. In a
+/// v1 multi-file torrent without pad files, only the first file is
+/// piece-aligned — hashing an interior file's first bytes never matches any
+/// piece hash (its first piece straddles the previous file's tail, verified
+/// live). But the file's offset in the torrent's piece stream is known from
+/// the files listing, so its first *fully contained* piece is too: matching
+/// falls back to "same exact size, then hash `piece_size` bytes at
+/// `probe_offset` and compare to `piece_hash`".
+pub type SizeCandidate {
+  SizeCandidate(
+    torrent_hash: String,
+    piece_hash: String,
+    probe_offset: Int,
+    piece_size: Int,
+  )
+}
+
 pub type Index {
   Index(
     torrents: Dict(String, TorrentEntry),
     by_piece_hash: Dict(String, List(String)),
+    by_file_size: Dict(Int, List(SizeCandidate)),
   )
 }
 
@@ -156,7 +175,11 @@ pub fn start(
 }
 
 fn empty_index() -> Index {
-  Index(torrents: dict.new(), by_piece_hash: dict.new())
+  Index(
+    torrents: dict.new(),
+    by_piece_hash: dict.new(),
+    by_file_size: dict.new(),
+  )
 }
 
 fn handle_message(
@@ -199,6 +222,10 @@ fn handle_message(
     }
     Lookup(piece_hash, reply_to) -> {
       process.send(reply_to, find_match(state.index, piece_hash))
+      actor.continue(state)
+    }
+    SizeCandidates(size, reply_to) -> {
+      process.send(reply_to, size_candidates(state.index, size))
       actor.continue(state)
     }
     PieceSizes(reply_to) -> {
@@ -440,7 +467,101 @@ pub fn build_index(entries: List(TorrentEntry)) -> Index {
       })
     })
 
-  Index(torrents:, by_piece_hash:)
+  let by_file_size =
+    list.fold(entries, dict.new(), fn(index, entry) {
+      list.fold(file_probes(entry), index, fn(index, probe) {
+        let #(size, candidate) = probe
+        dict.upsert(index, size, fn(existing) {
+          case existing {
+            Some(candidates) -> [candidate, ..candidates]
+            None -> [candidate]
+          }
+        })
+      })
+    })
+
+  Index(torrents:, by_piece_hash:, by_file_size:)
+}
+
+/// One SizeCandidate per file that fully contains at least one piece,
+/// walking the files in torrent order to know each one's offset in the
+/// piece stream.
+fn file_probes(entry: TorrentEntry) -> List(#(Int, SizeCandidate)) {
+  let #(probes, _total_size) =
+    list.fold(entry.files, #([], 0), fn(acc, file) {
+      let #(probes, offset) = acc
+      let probes = case probe_for(entry, file, offset) {
+        Ok(candidate) -> [#(file.size, candidate), ..probes]
+        Error(Nil) -> probes
+      }
+      #(probes, offset + file.size)
+    })
+  probes
+}
+
+fn probe_for(
+  entry: TorrentEntry,
+  file: TorrentFile,
+  offset: Int,
+) -> Result(SizeCandidate, Nil) {
+  let piece_size = entry.piece_size
+  let probe_offset = case offset % piece_size {
+    0 -> 0
+    remainder -> piece_size - remainder
+  }
+  let probe_piece = { offset + probe_offset } / piece_size
+  let #(range_start, range_end) = file.piece_range
+  // The file must fully contain the probe piece, and the piece index
+  // computed from cumulative sizes must agree with the piece_range
+  // qBittorrent reports — a mismatch would mean the files listing isn't in
+  // torrent order and every offset here is garbage.
+  case
+    probe_offset + piece_size <= file.size
+    && probe_piece >= range_start
+    && probe_piece <= range_end
+  {
+    False -> Error(Nil)
+    True ->
+      entry.piece_hashes
+      |> list.drop(probe_piece)
+      |> list.first
+      |> result.map(fn(piece_hash) {
+        SizeCandidate(
+          torrent_hash: entry.hash,
+          piece_hash:,
+          probe_offset:,
+          piece_size:,
+        )
+      })
+  }
+}
+
+pub fn size_candidates(index: Index, size: Int) -> List(SizeCandidate) {
+  dict.get(index.by_file_size, size) |> result.unwrap([])
+}
+
+/// Keeps only the candidates whose expected piece hash actually matches the
+/// file on disk — same exact size alone is coincidence, the piece hash is
+/// the proof. Several survivors with different torrent hashes is the
+/// cross-seed case, same as an Ambiguous match.
+pub fn verify_size_candidates(
+  path: String,
+  candidates: List(SizeCandidate),
+) -> List(SizeCandidate) {
+  candidates
+  |> list.filter(fn(candidate) {
+    case
+      piece_hasher.hash_piece_at(
+        path,
+        candidate.probe_offset,
+        candidate.piece_size,
+      )
+    {
+      Ok(hash) -> hash == candidate.piece_hash
+      Error(_) -> False
+    }
+  })
+  |> list.unique
 }
 
 pub fn find_match(index: Index, piece_hash: String) -> MatchResult {

@@ -3,7 +3,9 @@ import arr_sync/config
 import arr_sync/matcher/piece_hasher
 import arr_sync/matcher/torrent_index
 import arr_sync/watcher/fs_watcher
+import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{None, Some}
 import gleeunit
 
@@ -158,6 +160,157 @@ fn list_contains_both(candidates: List(String), a: String, b: String) -> Bool {
     [x, y] -> { x == a && y == b } || { x == b && y == a }
     _ -> False
   }
+}
+
+// Mirrors a layout verified live (qBittorrent 5.2.2, v1 torrent, no pad
+// files): aaa.dat is 100000 bytes so episode.bin starts at offset 100000 —
+// not a multiple of the 32768 piece size. Piece 3 straddles both files;
+// episode.bin's first fully contained piece is piece 4, which starts
+// 31072 bytes into the file.
+fn misaligned_pack_entry() -> torrent_index.TorrentEntry {
+  torrent_index.TorrentEntry(
+    hash: "pack-d",
+    name: "PackD",
+    save_path: "/data/PackD",
+    files: [
+      torrent_index.TorrentFile(
+        name: "PackD/aaa.dat",
+        size: 100_000,
+        progress: 1.0,
+        piece_range: #(0, 3),
+      ),
+      torrent_index.TorrentFile(
+        name: "PackD/episode.bin",
+        size: 4_194_304,
+        progress: 1.0,
+        piece_range: #(3, 131),
+      ),
+    ],
+    piece_size: 32_768,
+    piece_hashes: numbered_hashes(132),
+  )
+}
+
+fn numbered_hashes(count: Int) -> List(String) {
+  int.range(from: 0, to: count, with: [], run: fn(acc, index) {
+    ["h" <> int.to_string(index), ..acc]
+  })
+  |> list.reverse
+}
+
+pub fn size_candidates_probes_an_interior_misaligned_file_test() {
+  let index = torrent_index.build_index([misaligned_pack_entry()])
+
+  assert torrent_index.size_candidates(index, 4_194_304)
+    == [
+      torrent_index.SizeCandidate(
+        torrent_hash: "pack-d",
+        piece_hash: "h4",
+        probe_offset: 31_072,
+        piece_size: 32_768,
+      ),
+    ]
+}
+
+pub fn size_candidates_probes_an_aligned_first_file_at_offset_zero_test() {
+  let index = torrent_index.build_index([misaligned_pack_entry()])
+
+  assert torrent_index.size_candidates(index, 100_000)
+    == [
+      torrent_index.SizeCandidate(
+        torrent_hash: "pack-d",
+        piece_hash: "h0",
+        probe_offset: 0,
+        piece_size: 32_768,
+      ),
+    ]
+}
+
+pub fn size_candidates_skips_a_file_with_no_fully_contained_piece_test() {
+  // Second file is 30000 bytes: its first piece boundary is 31072 bytes in,
+  // past the end of the file — no piece is fully its own, so it can't be
+  // probed (and must not produce a bogus candidate).
+  let entry =
+    torrent_index.TorrentEntry(
+      hash: "pack-e",
+      name: "PackE",
+      save_path: "/data/PackE",
+      files: [
+        torrent_index.TorrentFile(
+          name: "PackE/aaa.dat",
+          size: 100_000,
+          progress: 1.0,
+          piece_range: #(0, 3),
+        ),
+        torrent_index.TorrentFile(
+          name: "PackE/tiny.bin",
+          size: 30_000,
+          progress: 1.0,
+          piece_range: #(3, 3),
+        ),
+      ],
+      piece_size: 32_768,
+      piece_hashes: ["h0", "h1", "h2", "h3"],
+    )
+  let index = torrent_index.build_index([entry])
+
+  assert torrent_index.size_candidates(index, 30_000) == []
+}
+
+pub fn size_candidates_skips_a_file_whose_piece_range_contradicts_offsets_test() {
+  // Defensive: probe offsets are computed from cumulative sizes in listing
+  // order. If the reported piece_range disagrees with that arithmetic, the
+  // listing can't be trusted and no candidate must be produced.
+  let entry =
+    torrent_index.TorrentEntry(
+      hash: "pack-f",
+      name: "PackF",
+      save_path: "/data/PackF",
+      files: [
+        torrent_index.TorrentFile(
+          name: "PackF/aaa.dat",
+          size: 100_000,
+          progress: 1.0,
+          piece_range: #(50, 53),
+        ),
+      ],
+      piece_size: 32_768,
+      piece_hashes: numbered_hashes(54),
+    )
+  let index = torrent_index.build_index([entry])
+
+  assert torrent_index.size_candidates(index, 100_000) == []
+}
+
+pub fn hash_piece_at_matches_sha1_of_the_slice_test() {
+  // sha1 of test/fixtures/sample.bin bytes [10, 30), precomputed with
+  // hashlib — a probe into the middle of the file, not its first bytes.
+  let assert Ok(hash) =
+    piece_hasher.hash_piece_at("test/fixtures/sample.bin", 10, 20)
+  assert hash == "53fbef2ce4dc5b5f79867dfca7dc84eccc100528"
+}
+
+pub fn verify_size_candidates_keeps_only_the_candidate_whose_piece_matches_test() {
+  let matching =
+    torrent_index.SizeCandidate(
+      torrent_hash: "torrent-a",
+      piece_hash: "53fbef2ce4dc5b5f79867dfca7dc84eccc100528",
+      probe_offset: 10,
+      piece_size: 20,
+    )
+  let wrong_content =
+    torrent_index.SizeCandidate(
+      torrent_hash: "torrent-b",
+      piece_hash: "0000000000000000000000000000000000000000",
+      probe_offset: 10,
+      piece_size: 20,
+    )
+
+  assert torrent_index.verify_size_candidates("test/fixtures/sample.bin", [
+      matching,
+      wrong_content,
+    ])
+    == [matching]
 }
 
 pub fn hash_first_pieces_matches_shasum_test() {

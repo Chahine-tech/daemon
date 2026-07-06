@@ -28,6 +28,23 @@ pub fn hash_first_pieces(
   })
 }
 
+/// Hashes `length` bytes of `path` starting at `offset` — for checking a
+/// torrent piece that lies at a known position *inside* the file, when the
+/// file doesn't start on a piece boundary (torrent_index's by-size
+/// fallback). A read past the end of the file hashes the bytes that exist,
+/// which is also how BitTorrent defines a torrent's short final piece.
+pub fn hash_piece_at(
+  path: String,
+  offset: Int,
+  length: Int,
+) -> Result(String, HashError) {
+  case hash_piece_ffi(path, offset, length) {
+    Ok(hex) -> Ok(hex)
+    Error(CannotOpen) -> Error(CannotOpenFile(path))
+    Error(TooSmall) -> Error(FileTooSmall(path))
+  }
+}
+
 type PreadError {
   CannotOpen
   TooSmall

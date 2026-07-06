@@ -87,12 +87,12 @@ fn handle_fs_event(state: SyncerState, fs_event: FsEvent) -> Nil {
 fn resync_if_large_enough(state: SyncerState, path: String) -> Nil {
   let min_size_bytes = state.config.sync.min_file_size_mb * 1_048_576
   case simplifile.file_info(path) {
-    Ok(info) if info.size >= min_size_bytes -> resync(state, path)
+    Ok(info) if info.size >= min_size_bytes -> resync(state, path, info.size)
     _ -> Nil
   }
 }
 
-fn resync(state: SyncerState, path: String) -> Nil {
+fn resync(state: SyncerState, path: String, size: Int) -> Nil {
   let piece_sizes = process.call(state.index, 5000, torrent_index.PieceSizes)
   let lookup = fn(hash) {
     process.call(state.index, 5000, torrent_index.Lookup(hash, _))
@@ -140,8 +140,42 @@ fn resync(state: SyncerState, path: String) -> Nil {
         )
       })
     }
-    Ok(torrent_index.NoMatch) | Error(Nil) ->
-      logging.log(logging.Info, "no torrent matches " <> path)
+    Ok(torrent_index.NoMatch) | Error(Nil) -> resync_by_size(state, path, size)
+  }
+}
+
+/// First-piece matching misses files that don't start on a piece boundary
+/// (interior files of a v1 multi-file torrent without pad files — verified
+/// live, see torrent_index.SizeCandidate). Fallback: candidates with the
+/// same exact size, verified by hashing the file's first fully-contained
+/// piece at its known in-file offset.
+fn resync_by_size(state: SyncerState, path: String, size: Int) -> Nil {
+  let candidates =
+    process.call(state.index, 5000, torrent_index.SizeCandidates(size, _))
+  case torrent_index.verify_size_candidates(path, candidates) {
+    [] -> logging.log(logging.Info, "no torrent matches " <> path)
+    verified -> {
+      logging.log(
+        logging.Info,
+        path
+          <> " matches by size + interior piece, resyncing: "
+          <> string.join(
+          list.map(verified, fn(candidate) { candidate.torrent_hash }),
+          ", ",
+        ),
+      )
+      list.each(verified, fn(candidate) {
+        process.send(
+          state.index,
+          torrent_index.Resync(
+            candidate.torrent_hash,
+            candidate.piece_hash,
+            path,
+            state.resync_outcomes,
+          ),
+        )
+      })
+    }
   }
 }
 

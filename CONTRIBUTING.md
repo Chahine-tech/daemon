@@ -10,7 +10,7 @@ docker compose up -d     # disposable qBittorrent to test the HTTP client agains
 ## Running checks
 
 ```sh
-make test               # 25 tests, no network required (or: gleam test)
+make test               # 31 tests, no network required (or: gleam test)
 make format-check        # or: gleam format --check
 ```
 
