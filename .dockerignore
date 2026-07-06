@@ -1,0 +1,9 @@
+build
+.git
+.github
+test
+*.md
+arr-sync.toml
+.arr-sync-cookie
+docker-compose.yml
+Makefile

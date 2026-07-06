@@ -79,7 +79,9 @@ pub fn query_status() -> StatusReport {
 pub fn query_remote_status(
   daemon_short_name: String,
 ) -> Result(StatusReport, DistributionError) {
-  let node_name = daemon_short_name <> "@" <> hostname()
+  // @localhost, matching how ensure_started names every node — see the FFI
+  // for why the machine's hostname can't be used here.
+  let node_name = daemon_short_name <> "@localhost"
   case ping(node_name) {
     False -> Error(DaemonUnreachable)
     True -> rpc_query_status(node_name, 5000) |> result.map_error(RpcFailed)
@@ -91,9 +93,6 @@ fn fixed_name(prefix: String) -> process.Name(msg)
 
 @external(erlang, "arr_sync_distribution_ffi", "ensure_started")
 fn ensure_started_ffi(short_name: String, cookie: String) -> Result(Nil, String)
-
-@external(erlang, "arr_sync_distribution_ffi", "hostname")
-pub fn hostname() -> String
 
 @external(erlang, "arr_sync_distribution_ffi", "node_name")
 pub fn node_name() -> String

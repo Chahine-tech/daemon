@@ -1,6 +1,7 @@
 [qbittorrent]
 url = "http://localhost:8080"
 username = "admin"
+# Optional if the QBITTORRENT_PASSWORD env var is set (the env var wins).
 password = "password"
 
 [watch]

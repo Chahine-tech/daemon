@@ -61,9 +61,24 @@ fn parse_qbittorrent(
 ) -> Result(QbittorrentConfig, ConfigError) {
   use url <- result.try(get_string(document, ["qbittorrent", "url"]))
   use username <- result.try(get_string(document, ["qbittorrent", "username"]))
-  use password <- result.try(get_string(document, ["qbittorrent", "password"]))
+  use password <- result.try(qbittorrent_password(document))
   Ok(QbittorrentConfig(url:, username:, password:))
 }
+
+/// QBITTORRENT_PASSWORD wins over the config file, so the secret can stay
+/// out of arr-sync.toml entirely (Docker/compose secrets) — with the env
+/// var set, the `password` field becomes optional.
+fn qbittorrent_password(
+  document: Dict(String, Toml),
+) -> Result(String, ConfigError) {
+  case os_env("QBITTORRENT_PASSWORD") {
+    Ok(password) -> Ok(password)
+    Error(Nil) -> get_string(document, ["qbittorrent", "password"])
+  }
+}
+
+@external(erlang, "arr_sync_config_ffi", "os_env")
+fn os_env(name: String) -> Result(String, Nil)
 
 fn parse_watch(
   document: Dict(String, Toml),

@@ -78,6 +78,30 @@ Module names are global across the whole BEAM, so both layers are namespaced to 
 
 ## Installation
 
+### Docker (recommended)
+
+```yaml
+services:
+  arr-sync:
+    image: ghcr.io/chahine-tech/arr-sync:latest
+    restart: unless-stopped    # also retries until qBittorrent is up at boot
+    environment:
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD}
+    volumes:
+      - ./arr-sync.toml:/config/arr-sync.toml:ro
+      - /data/media:/data/media    # must be the SAME path qBittorrent sees
+```
+
+The one rule that matters: **arr-sync and qBittorrent must see the media at the same literal path** — matching relies on qBittorrent's `save_path` being meaningful on arr-sync's filesystem. Mount the same volume at the same place in both containers.
+
+`arr-sync status` inside the container:
+
+```sh
+docker exec <container> /app/entrypoint.sh run status
+```
+
+### From source
+
 ```sh
 brew install gleam erlang    # or your package manager of choice
 gleam deps download
@@ -108,7 +132,7 @@ Every target runs the exported `build/erlang-shipment/entrypoint.sh` (a standalo
 
 | Section | Fields | Description |
 |---|---|---|
-| `[qbittorrent]` | `url`, `username`, `password` | qBittorrent WebUI |
+| `[qbittorrent]` | `url`, `username`, `password` | qBittorrent WebUI. `password` can be omitted if the `QBITTORRENT_PASSWORD` env var is set (it wins over the file either way) |
 | `[watch]` | `paths` | Watched directories |
 | `[sync]` | `recheck_delay`, `min_file_size_mb` | Seconds to wait after `renameFile` before forcing a `recheck`; minimum file size (MB) before a Created event is worth hashing at all, to skip sidecar files (subtitles, `.nfo`, thumbnails) |
 | `[sonarr]` *(optional)* | `url`, `api_key` | Post-resync notification |
@@ -144,9 +168,9 @@ The `Makefile` sets `ERL_FLAGS="-fs backwards_compatible false"` before running 
 
 ### `arr-sync status`
 
-The daemon becomes a distributed Erlang node on startup (`arr_sync@<hostname>`), authenticated with a per-install cookie generated on first run and stored in `.arr-sync-cookie` (mode 0600, gitignored — not the shared `~/.erlang.cookie`). `status` starts a short-lived node of its own and reaches the daemon over `rpc:call`. Localhost only, and enforced: distributed Erlang RPC can run arbitrary code once connected, and both the distribution listener and epmd default to listening on **every** interface — so the `Makefile` pins them to loopback (`-kernel inet_dist_use_interface '{127,0,0,1}'` and `ERL_EPMD_ADDRESS=127.0.0.1`, verified with `lsof`/LAN probes). One more reason not to call `entrypoint.sh` directly.
+The daemon becomes a distributed Erlang node on startup (`arr_sync@localhost`), authenticated with a per-install cookie generated on first run and stored in `.arr-sync-cookie` (mode 0600, gitignored — not the shared `~/.erlang.cookie`). `status` starts a short-lived node of its own and reaches the daemon over `rpc:call`. Localhost only, and enforced: distributed Erlang RPC can run arbitrary code once connected, and both the distribution listener and epmd default to listening on **every** interface — so the `Makefile` and the `Dockerfile` pin them to loopback (`-kernel inet_dist_use_interface '{127,0,0,1}'` and `ERL_EPMD_ADDRESS=127.0.0.1`, verified with `lsof`/LAN probes). One more reason not to call `entrypoint.sh` directly.
 
-Gotcha found while wiring this up: use `inet:gethostname()`, not `net_adm:localhost()`, to build the node name — the latter appends the machine's mDNS suffix (`.local` on macOS), which `node()` itself doesn't use, so the two ends disagree on the daemon's name.
+The node is named `arr_sync@localhost` rather than `arr_sync@<hostname>` on purpose: with the listener bound to loopback, `status` must dial an address that actually resolves to loopback, and a machine's hostname often doesn't — inside a Docker container it resolves to the container IP (found live: `status` worked on macOS but not in Docker until the name was pinned).
 
 ---
 
