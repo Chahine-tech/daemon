@@ -70,6 +70,7 @@ fn start(config_path: String) -> Nil {
             torrent_index.start(
               credentials,
               loaded_config.sync.recheck_delay_seconds,
+              loaded_config.path_mappings,
               index_name,
             )
           })
@@ -161,10 +162,10 @@ fn show_status() -> Nil {
   }
 }
 
-/// Loads arr-sync.toml, logs into qBittorrent, and hands the session to
-/// `action` — shared by every CLI subcommand that just needs one-off
-/// access to qBittorrent, without the daemon's supervision tree.
-fn with_session(action: fn(qbittorrent.Session) -> Nil) -> Nil {
+/// Loads arr-sync.toml, logs into qBittorrent, and hands the session and
+/// config to `action` — shared by every CLI subcommand that just needs
+/// one-off access to qBittorrent, without the daemon's supervision tree.
+fn with_session(action: fn(qbittorrent.Session, config.Config) -> Nil) -> Nil {
   case config.load("arr-sync.toml") {
     Error(_reason) ->
       logging.log(logging.Error, "failed to load config from arr-sync.toml")
@@ -177,21 +178,21 @@ fn with_session(action: fn(qbittorrent.Session) -> Nil) -> Nil {
         )
       case qbittorrent.login(credentials) {
         Error(_reason) -> logging.log(logging.Error, "qBittorrent login failed")
-        Ok(session) -> action(session)
+        Ok(session) -> action(session, loaded_config)
       }
     }
   }
 }
 
 fn match_file(path: String) -> Nil {
-  use session <- with_session()
-  let index = torrent_index.fetch_index(session)
+  use session, loaded_config <- with_session()
+  let index = torrent_index.fetch_index(session, loaded_config.path_mappings)
   report_match(path, index)
 }
 
 fn list_torrents() -> Nil {
-  use session <- with_session()
-  let index = torrent_index.fetch_index(session)
+  use session, loaded_config <- with_session()
+  let index = torrent_index.fetch_index(session, loaded_config.path_mappings)
   case dict.values(index.torrents) {
     [] -> logging.log(logging.Info, "no torrents indexed")
     entries ->
@@ -202,7 +203,7 @@ fn list_torrents() -> Nil {
 }
 
 fn force_resync(torrent_hash: String) -> Nil {
-  use session <- with_session()
+  use session, _loaded_config <- with_session()
   case qbittorrent.recheck(session, torrent_hash) {
     Ok(Nil) ->
       logging.log(logging.Info, "recheck triggered for " <> torrent_hash)
@@ -215,9 +216,9 @@ fn force_resync(torrent_hash: String) -> Nil {
 }
 
 fn report_match(path: String, index: torrent_index.Index) -> Nil {
-  let piece_sizes = torrent_index.piece_sizes(index)
+  let probes = torrent_index.probes(index)
   let lookup = fn(hash) { torrent_index.find_match(index, hash) }
-  case torrent_index.find_first_match(path, piece_sizes, lookup) {
+  case torrent_index.find_first_match(path, probes, lookup) {
     Ok(torrent_index.Matched(torrent_hash, _piece_hash)) ->
       logging.log(logging.Info, path <> " matches torrent " <> torrent_hash)
     Ok(torrent_index.Ambiguous(_piece_hash, candidates)) ->

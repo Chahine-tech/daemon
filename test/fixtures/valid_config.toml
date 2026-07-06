@@ -10,6 +10,10 @@ paths = ["/data/media/movies", "/data/media/tv"]
 recheck_delay = 5
 min_file_size_mb = 10
 
+[[path_mappings]]
+remote = "/downloads"
+local = "/data/torrents"
+
 [sonarr]
 url = "http://localhost:8989"
 api_key = "sonarr-key"

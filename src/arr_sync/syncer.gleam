@@ -93,12 +93,12 @@ fn resync_if_large_enough(state: SyncerState, path: String) -> Nil {
 }
 
 fn resync(state: SyncerState, path: String, size: Int) -> Nil {
-  let piece_sizes = process.call(state.index, 5000, torrent_index.PieceSizes)
+  let probes = process.call(state.index, 5000, torrent_index.Probes)
   let lookup = fn(hash) {
     process.call(state.index, 5000, torrent_index.Lookup(hash, _))
   }
 
-  case torrent_index.find_first_match(path, piece_sizes, lookup) {
+  case torrent_index.find_first_match(path, probes, lookup) {
     Ok(torrent_index.Matched(torrent_hash, piece_hash)) -> {
       // Fire-and-forget: a resync takes seconds (recheck delay, retry
       // backoffs), and the next fs event can't wait on it — the outcome
@@ -191,7 +191,7 @@ fn handle_resync_outcome(
           <> " resynced with torrent "
           <> outcome.torrent_hash,
       )
-      notify_arr_stack(state.config, outcome.new_absolute_path)
+      notify_arr_stack(state.config)
     }
     Error(reason) ->
       logging.log(
@@ -206,14 +206,14 @@ fn handle_resync_outcome(
   }
 }
 
-fn notify_arr_stack(config: Config, path: String) -> Nil {
+fn notify_arr_stack(config: Config) -> Nil {
   case config.sonarr {
     None -> Nil
     Some(arr_config) -> {
       let credentials =
         sonarr.Credentials(url: arr_config.url, api_key: arr_config.api_key)
-      case sonarr.notify_file_synced(credentials, path) {
-        Ok(Nil) -> Nil
+      case sonarr.notify_file_synced(credentials) {
+        Ok(Nil) -> logging.log(logging.Info, "sonarr rescan requested")
         Error(reason) ->
           logging.log(
             logging.Warning,
@@ -228,8 +228,8 @@ fn notify_arr_stack(config: Config, path: String) -> Nil {
     Some(arr_config) -> {
       let credentials =
         radarr.Credentials(url: arr_config.url, api_key: arr_config.api_key)
-      case radarr.notify_file_synced(credentials, path) {
-        Ok(Nil) -> Nil
+      case radarr.notify_file_synced(credentials) {
+        Ok(Nil) -> logging.log(logging.Info, "radarr rescan requested")
         Error(reason) ->
           logging.log(
             logging.Warning,

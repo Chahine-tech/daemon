@@ -1,6 +1,8 @@
 import arr_sync/client/qbittorrent.{type Session}
 import arr_sync/logging
 import arr_sync/matcher/piece_hasher
+import arr_sync/matcher/torrent_file
+import arr_sync/paths
 import filepath
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
@@ -28,8 +30,19 @@ pub type TorrentEntry {
     save_path: String,
     files: List(TorrentFile),
     piece_size: Int,
+    // Global piece numbering, matching qBittorrent's piece_range indexes.
+    // For a v2 entry, slots belonging to a file too small to have a piece
+    // layer hold "" — a placeholder no lookup can hit (see build_index).
     piece_hashes: List(String),
+    algorithm: piece_hasher.HashAlgorithm,
   )
+}
+
+/// One way of probing a file on disk against the index: hash its first
+/// piece_size bytes with this algorithm. One Probe per distinct
+/// (piece_size, algorithm) pair present in the index.
+pub type Probe {
+  Probe(piece_size: Int, algorithm: piece_hasher.HashAlgorithm)
 }
 
 pub type MatchResult {
@@ -78,7 +91,7 @@ pub type Message {
   )
   Lookup(piece_hash: String, reply_to: Subject(MatchResult))
   SizeCandidates(size: Int, reply_to: Subject(List(SizeCandidate)))
-  PieceSizes(reply_to: Subject(List(Int)))
+  Probes(reply_to: Subject(List(Probe)))
   Status(reply_to: Subject(IndexStatus))
   Resync(
     torrent_hash: String,
@@ -127,6 +140,7 @@ type IndexState {
     index: Index,
     self: Subject(Message),
     recheck_delay_seconds: Int,
+    path_mappings: List(paths.PathMapping),
     resync_success_count: Int,
     resync_failure_count: Int,
   )
@@ -144,15 +158,19 @@ const max_retries = 3
 pub fn start(
   credentials: qbittorrent.Credentials,
   recheck_delay_seconds: Int,
+  path_mappings: List(paths.PathMapping),
   name: process.Name(Message),
 ) -> actor.StartResult(Subject(Message)) {
   actor.new_with_initialiser(15_000, fn(subject) {
+    let path_mappings = paths.canonicalize_locals(path_mappings)
     case qbittorrent.login(credentials) {
       Ok(session) -> {
         // Fetch the index synchronously at startup — the first scheduled
         // Refresh is 5 minutes away, so without this the actor would sit
         // empty (and match nothing) until then.
-        let index = fetch_index_result(session) |> result.unwrap(empty_index())
+        let index =
+          fetch_index_result(session, path_mappings)
+          |> result.unwrap(empty_index())
         process.send_after(subject, refresh_interval_ms, Refresh)
         actor.initialised(IndexState(
           credentials:,
@@ -160,6 +178,7 @@ pub fn start(
           index:,
           self: subject,
           recheck_delay_seconds:,
+          path_mappings:,
           resync_success_count: 0,
           resync_failure_count: 0,
         ))
@@ -198,7 +217,10 @@ fn handle_message(
     Refresh -> {
       let snapshot = state
       process.spawn_unlinked(fn() {
-        let #(result, worker_state) = with_retry(snapshot, fetch_index_result)
+        let #(result, worker_state) =
+          with_retry(snapshot, fn(session) {
+            fetch_index_result(session, snapshot.path_mappings)
+          })
         process.send(snapshot.self, IndexFetched(result, worker_state.session))
       })
       process.send_after(state.self, refresh_interval_ms, Refresh)
@@ -228,8 +250,8 @@ fn handle_message(
       process.send(reply_to, size_candidates(state.index, size))
       actor.continue(state)
     }
-    PieceSizes(reply_to) -> {
-      process.send(reply_to, piece_sizes(state.index))
+    Probes(reply_to) -> {
+      process.send(reply_to, probes(state.index))
       actor.continue(state)
     }
     Status(reply_to) -> {
@@ -368,22 +390,40 @@ fn backoff_delay_ms(attempt_number: Int) -> Int {
   1000 * int.bitwise_shift_left(1, attempt_number - 1)
 }
 
-pub fn fetch_index(session: Session) -> Index {
-  fetch_index_result(session) |> result.unwrap(empty_index())
+pub fn fetch_index(
+  session: Session,
+  path_mappings: List(paths.PathMapping),
+) -> Index {
+  fetch_index_result(session, paths.canonicalize_locals(path_mappings))
+  |> result.unwrap(empty_index())
 }
 
 fn fetch_index_result(
   session: Session,
+  path_mappings: List(paths.PathMapping),
 ) -> Result(Index, qbittorrent.QbittorrentError) {
   use summaries <- result.try(qbittorrent.list_torrents(session))
   summaries
-  |> list.filter_map(fn(summary) { fetch_entry(session, summary) })
+  |> list.filter_map(fn(summary) {
+    fetch_entry(session, path_mappings, summary)
+  })
   |> build_index
   |> Ok
 }
 
+/// The save_path stored in the index is the *daemon's* form of the path —
+/// mapped out of qBittorrent's view, then canonicalized so symlinked
+/// prefixes (macOS /tmp -> /private/tmp) compare equal to fs event paths.
+fn local_save_path(
+  path_mappings: List(paths.PathMapping),
+  save_path: String,
+) -> String {
+  paths.canonicalize(paths.to_local(path_mappings, save_path))
+}
+
 fn fetch_entry(
   session: Session,
+  path_mappings: List(paths.PathMapping),
   summary: qbittorrent.TorrentSummary,
 ) -> Result(TorrentEntry, Nil) {
   case
@@ -391,34 +431,20 @@ fn fetch_entry(
     qbittorrent.piece_hashes(session, summary.hash),
     qbittorrent.properties(session, summary.hash)
   {
-    Ok(_), Ok(_), Ok(properties) if properties.infohash_v1 == "" -> {
-      // Pure BitTorrent v2 torrent: qBittorrent doesn't expose real piece
-      // hashes for these (verified live against 5.2.2, see
-      // properties_decoder's doc comment) — indexing them would poison
-      // by_piece_hash with garbage entries under this torrent's hash.
-      logging.log(
-        logging.Warning,
-        "skipping torrent "
-          <> summary.hash
-          <> ": pure BitTorrent v2 torrent, qBittorrent does not expose usable piece hashes for it",
-      )
-      Error(Nil)
-    }
+    Ok(files), Ok(_garbage), Ok(properties) if properties.infohash_v1 == "" ->
+      // Pure BitTorrent v2 torrent: pieceHashes returned garbage (verified
+      // live against 5.2.2, see properties_decoder's doc comment), so the
+      // real SHA256 hashes come from parsing the exported .torrent instead.
+      fetch_v2_entry(session, path_mappings, summary, files, properties)
     Ok(files), Ok(piece_hashes), Ok(properties) ->
       Ok(TorrentEntry(
         hash: summary.hash,
         name: summary.name,
-        save_path: summary.save_path,
-        files: list.map(files, fn(file) {
-          TorrentFile(
-            name: file.name,
-            size: file.size,
-            progress: file.progress,
-            piece_range: file.piece_range,
-          )
-        }),
+        save_path: local_save_path(path_mappings, summary.save_path),
+        files: to_torrent_files(files),
         piece_size: properties.piece_size,
         piece_hashes:,
+        algorithm: piece_hasher.Sha1Flat,
       ))
     _, _, _ -> {
       logging.log(
@@ -432,6 +458,122 @@ fn fetch_entry(
   }
 }
 
+fn to_torrent_files(
+  files: List(qbittorrent.RemoteTorrentFile),
+) -> List(TorrentFile) {
+  list.map(files, fn(file) {
+    TorrentFile(
+      name: file.name,
+      size: file.size,
+      progress: file.progress,
+      piece_range: file.piece_range,
+    )
+  })
+}
+
+fn fetch_v2_entry(
+  session: Session,
+  path_mappings: List(paths.PathMapping),
+  summary: qbittorrent.TorrentSummary,
+  files: List(qbittorrent.RemoteTorrentFile),
+  properties: qbittorrent.TorrentProperties,
+) -> Result(TorrentEntry, Nil) {
+  let entry = {
+    use raw <- result.try(
+      qbittorrent.export_torrent(session, summary.hash)
+      |> result.replace_error(Nil),
+    )
+    use metadata <- result.try(torrent_file.parse_v2(raw))
+    use piece_hashes <- result.try(flatten_v2_piece_hashes(metadata, files))
+    Ok(TorrentEntry(
+      hash: summary.hash,
+      name: summary.name,
+      save_path: local_save_path(path_mappings, summary.save_path),
+      files: to_torrent_files(files),
+      piece_size: properties.piece_size,
+      piece_hashes:,
+      algorithm: piece_hasher.Sha256Merkle,
+    ))
+  }
+  case entry {
+    Ok(_) -> entry
+    Error(Nil) -> {
+      logging.log(
+        logging.Warning,
+        "skipping torrent "
+          <> summary.hash
+          <> ": pure BitTorrent v2 torrent whose exported .torrent could not be parsed",
+      )
+      Error(Nil)
+    }
+  }
+}
+
+/// Lays each file's piece-layer hashes out on qBittorrent's global piece
+/// numbering (each v2 file starts its own piece, so files' ranges are
+/// contiguous and disjoint — verified live). Cross-checks sizes, contiguity
+/// and hash counts against the piece_range the API reports; any mismatch
+/// fails the whole torrent rather than risking a hash landing on the wrong
+/// index.
+@internal
+pub fn flatten_v2_piece_hashes(
+  metadata: torrent_file.V2Metadata,
+  files: List(qbittorrent.RemoteTorrentFile),
+) -> Result(List(String), Nil) {
+  files
+  |> list.sort(fn(a, b) { int.compare(a.piece_range.0, b.piece_range.0) })
+  |> flatten_v2_files(metadata, 0, [])
+}
+
+fn flatten_v2_files(
+  files: List(qbittorrent.RemoteTorrentFile),
+  metadata: torrent_file.V2Metadata,
+  expected_start: Int,
+  accumulated: List(List(String)),
+) -> Result(List(String), Nil) {
+  case files {
+    [] -> Ok(accumulated |> list.reverse |> list.flatten)
+    [file, ..rest] -> {
+      let #(start, end) = file.piece_range
+      case start == expected_start && end >= start {
+        False -> Error(Nil)
+        True -> {
+          let span = end - start + 1
+          use v2_file <- result.try(find_v2_file(metadata, file))
+          use hashes <- result.try(case v2_file.piece_hashes {
+            // No piece layer: the file fits in one piece. Hold its slot
+            // with a placeholder no lookup can hit, so the numbering of
+            // everything after it stays right.
+            [] if span == 1 -> Ok([""])
+            [] -> Error(Nil)
+            hashes ->
+              case list.length(hashes) == span {
+                True -> Ok(hashes)
+                False -> Error(Nil)
+              }
+          })
+          flatten_v2_files(rest, metadata, end + 1, [hashes, ..accumulated])
+        }
+      }
+    }
+  }
+}
+
+fn find_v2_file(
+  metadata: torrent_file.V2Metadata,
+  file: qbittorrent.RemoteTorrentFile,
+) -> Result(torrent_file.V2File, Nil) {
+  // Multi-file torrents prefix API names with the torrent name; a
+  // single-file torrent's API name is the bare filename.
+  list.find(metadata.files, fn(candidate) {
+    candidate.size == file.size
+    && {
+      file.name == candidate.path
+      || file.name == metadata.name <> "/" <> candidate.path
+    }
+  })
+}
+
 /// The distinct piece sizes present in the index. In practice a small,
 /// stable set (BitTorrent clients pick from a handful of standard sizes),
 /// so this drives how many times a candidate file needs re-hashing.
@@ -439,6 +581,17 @@ pub fn piece_sizes(index: Index) -> List(Int) {
   index.torrents
   |> dict.values
   |> list.map(fn(entry) { entry.piece_size })
+  |> list.unique
+}
+
+/// The distinct (piece_size, algorithm) pairs a candidate file needs to be
+/// hashed with to be looked up against everything indexed.
+pub fn probes(index: Index) -> List(Probe) {
+  index.torrents
+  |> dict.values
+  |> list.map(fn(entry) {
+    Probe(piece_size: entry.piece_size, algorithm: entry.algorithm)
+  })
   |> list.unique
 }
 
@@ -454,16 +607,22 @@ pub fn build_index(entries: List(TorrentEntry)) -> Index {
   let by_piece_hash =
     list.fold(entries, dict.new(), fn(index, entry) {
       list.fold(entry.piece_hashes, index, fn(index, piece_hash) {
-        dict.upsert(index, piece_hash, fn(existing) {
-          case existing {
-            Some(torrent_hashes) ->
-              case list.contains(torrent_hashes, entry.hash) {
-                True -> torrent_hashes
-                False -> [entry.hash, ..torrent_hashes]
+        case piece_hash {
+          // Placeholder slot for a v2 file with no piece layer — not a
+          // real hash, never a lookup key.
+          "" -> index
+          _ ->
+            dict.upsert(index, piece_hash, fn(existing) {
+              case existing {
+                Some(torrent_hashes) ->
+                  case list.contains(torrent_hashes, entry.hash) {
+                    True -> torrent_hashes
+                    False -> [entry.hash, ..torrent_hashes]
+                  }
+                None -> [entry.hash]
               }
-            None -> [entry.hash]
-          }
-        })
+            })
+        }
       })
     })
 
@@ -485,8 +644,18 @@ pub fn build_index(entries: List(TorrentEntry)) -> Index {
 
 /// One SizeCandidate per file that fully contains at least one piece,
 /// walking the files in torrent order to know each one's offset in the
-/// piece stream.
+/// piece stream. v1 only: v2 files always start on a piece boundary
+/// (BEP 52), so the first-piece probe already covers every one of them —
+/// and this function's cumulative-offset arithmetic doesn't hold for v2's
+/// per-file piece numbering anyway.
 fn file_probes(entry: TorrentEntry) -> List(#(Int, SizeCandidate)) {
+  case entry.algorithm {
+    piece_hasher.Sha256Merkle -> []
+    piece_hasher.Sha1Flat -> sha1_file_probes(entry)
+  }
+}
+
+fn sha1_file_probes(entry: TorrentEntry) -> List(#(Int, SizeCandidate)) {
   let #(probes, _total_size) =
     list.fold(entry.files, #([], 0), fn(acc, file) {
       let #(probes, offset) = acc
@@ -626,6 +795,7 @@ fn piece_index_of(
 fn do_resync(
   session: Session,
   index: Index,
+  path_mappings: List(paths.PathMapping),
   torrent_hash: String,
   piece_hash: String,
   new_absolute_path: String,
@@ -646,6 +816,10 @@ fn do_resync(
     Error(_) -> Ok(Nil)
   })
 
+  // entry.save_path is in the daemon's (local, canonical) form — bring the
+  // event path to the same form before comparing.
+  let new_absolute_path = paths.canonicalize(new_absolute_path)
+
   use new_relative_path <- result.try(
     case relative_to(entry.save_path, new_absolute_path) {
       Ok(relative_path) -> Ok(relative_path)
@@ -653,8 +827,13 @@ fn do_resync(
         // Left save_path's tree entirely: move save_path to the new parent
         // directory, then rename with just the filename — we can't infer
         // intended subdirectory structure from a path outside the torrent's
-        // own tree.
-        let new_dir = filepath.directory_name(new_absolute_path)
+        // own tree. setLocation talks to qBittorrent, so the directory goes
+        // back through the path mappings into qBittorrent's form.
+        let new_dir =
+          paths.to_remote(
+            path_mappings,
+            filepath.directory_name(new_absolute_path),
+          )
         use _ <- result.try(
           qbittorrent.set_location(session, torrent_hash, new_dir)
           |> result.map_error(QbittorrentFailure),
@@ -690,6 +869,7 @@ fn resync_with_retry(
     do_resync(
       state.session,
       state.index,
+      state.path_mappings,
       torrent_hash,
       piece_hash,
       new_absolute_path,
@@ -758,27 +938,27 @@ pub fn relative_to(base: String, path: String) -> Result(String, Nil) {
   }
 }
 
-/// Tries each candidate piece size against `path` (a file's piece hash only
-/// lines up with a torrent using the same piece size), stopping at the
+/// Tries each probe against `path` (a file's piece hash only lines up with
+/// a torrent using the same piece size and hash algorithm), stopping at the
 /// first one that produces a match. `lookup` is injected so this works both
 /// synchronously against an already-fetched `Index` (the CLI) and via
 /// actor round-trips against a running torrent_index (the daemon).
 pub fn find_first_match(
   path: String,
-  piece_sizes: List(Int),
+  probes: List(Probe),
   lookup: fn(String) -> MatchResult,
 ) -> Result(MatchResult, Nil) {
-  case piece_sizes {
+  case probes {
     [] -> Error(Nil)
-    [piece_size, ..rest] ->
+    [probe, ..rest] ->
       case
-        piece_hasher.hash_first_pieces(
+        piece_hasher.hash_first_piece(
           path,
-          piece_hasher.PieceSize(piece_size),
-          1,
+          piece_hasher.PieceSize(probe.piece_size),
+          probe.algorithm,
         )
       {
-        Ok([piece_hash, ..]) ->
+        Ok(piece_hash) ->
           case lookup(piece_hash) {
             NoMatch -> find_first_match(path, rest, lookup)
             result -> Ok(result)

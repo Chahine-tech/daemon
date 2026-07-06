@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/http.{type Method, Get, Post}
 import gleam/http/request.{type Request}
@@ -126,6 +127,37 @@ pub fn piece_hashes(
     "/api/v2/torrents/pieceHashes?hash=" <> uri.percent_encode(torrent_hash),
   ))
   decode_body(http_response, decode.list(decode.string))
+}
+
+/// GET /api/v2/torrents/export — the torrent's original .torrent file, raw
+/// bencode bytes. The only way to get real piece hashes for a pure
+/// BitTorrent v2 torrent, whose pieceHashes endpoint is broken (see
+/// properties_decoder's doc comment).
+pub fn export_torrent(
+  session: Session,
+  torrent_hash: String,
+) -> Result(BitArray, QbittorrentError) {
+  use http_request <- result.try(authenticated_request(
+    session,
+    Get,
+    "/api/v2/torrents/export?hash=" <> uri.percent_encode(torrent_hash),
+  ))
+  use http_response <- result.try(
+    safe_call(fn() {
+      http_request
+      |> request.set_body(<<>>)
+      |> httpc.send_bits
+      |> result.map_error(RequestFailed)
+    }),
+  )
+  case http_response.status {
+    200 -> Ok(http_response.body)
+    status ->
+      Error(UnexpectedStatus(
+        status,
+        bit_array.to_string(http_response.body) |> result.unwrap(""),
+      ))
+  }
 }
 
 /// POST /api/v2/torrents/setLocation — moves the torrent to a different

@@ -14,21 +14,20 @@ pub type NotifyError {
   UnexpectedStatus(status: Int, body: String)
 }
 
-/// Notifies Radarr that a file has been resynced, so it refreshes its
-/// internal state (DownloadedMoviesScan command). Structurally correct
-/// against Radarr's documented v3 API (same request-building pattern as the
-/// qBittorrent client), but — unlike qBittorrent — not verified against a
-/// live Radarr instance.
+/// Asks Radarr to rescan its library from disk after a resync — same
+/// reasoning and same live findings as the Sonarr client: RescanMovie
+/// completes successfully against a live Radarr 5.x, while the
+/// DownloadedMoviesScan command previously used here reports 201 but fails
+/// inside Radarr.
 pub fn notify_file_synced(
   credentials: Credentials,
-  _path: String,
 ) -> Result(Nil, NotifyError) {
   use base_request <- result.try(
     request.to(credentials.url <> "/api/v3/command")
     |> result.map_error(fn(_) { InvalidUrl(credentials.url) }),
   )
 
-  let body = json.object([#("name", json.string("DownloadedMoviesScan"))])
+  let body = json.object([#("name", json.string("RescanMovie"))])
 
   let http_request =
     base_request

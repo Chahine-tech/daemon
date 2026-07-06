@@ -15,6 +15,13 @@ paths = [
 recheck_delay = 5
 min_file_size_mb = 10
 
+# Optional, repeatable: translate qBittorrent's paths to arr-sync's, like
+# Sonarr/Radarr's Remote Path Mappings — only needed when the two don't
+# mount the media at the same path.
+# [[path_mappings]]
+# remote = "/data/media"
+# local = "/media"
+
 # Optional: notify Sonarr/Radarr after a resync
 [sonarr]
 url = "http://localhost:8989"

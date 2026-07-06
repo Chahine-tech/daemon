@@ -1,3 +1,4 @@
+import arr_sync/paths
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -26,6 +27,7 @@ pub type Config {
     qbittorrent: QbittorrentConfig,
     watch: WatchConfig,
     sync: SyncConfig,
+    path_mappings: List(paths.PathMapping),
     sonarr: Option(ArrConfig),
     radarr: Option(ArrConfig),
   )
@@ -51,9 +53,29 @@ fn parse_config(document: Dict(String, Toml)) -> Result(Config, ConfigError) {
   use qbittorrent <- result.try(parse_qbittorrent(document))
   use watch <- result.try(parse_watch(document))
   use sync <- result.try(parse_sync(document))
+  use path_mappings <- result.try(parse_path_mappings(document))
   use sonarr <- result.try(parse_optional_arr(document, "sonarr"))
   use radarr <- result.try(parse_optional_arr(document, "radarr"))
-  Ok(Config(qbittorrent:, watch:, sync:, sonarr:, radarr:))
+  Ok(Config(qbittorrent:, watch:, sync:, path_mappings:, sonarr:, radarr:))
+}
+
+// Optional [[path_mappings]] array of tables — see paths.PathMapping.
+fn parse_path_mappings(
+  document: Dict(String, Toml),
+) -> Result(List(paths.PathMapping), ConfigError) {
+  case tom.get_array(document, ["path_mappings"]) {
+    Error(tom.NotFound(_)) -> Ok([])
+    Error(err) -> Error(InvalidField(err))
+    Ok(entries) ->
+      entries
+      |> list.try_map(fn(entry) {
+        use table <- result.try(tom.as_table(entry))
+        use remote <- result.try(tom.get_string(table, ["remote"]))
+        use local <- result.try(tom.get_string(table, ["local"]))
+        Ok(paths.PathMapping(remote:, local:))
+      })
+      |> result.map_error(InvalidField)
+  }
 }
 
 fn parse_qbittorrent(

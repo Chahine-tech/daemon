@@ -14,21 +14,22 @@ pub type NotifyError {
   UnexpectedStatus(status: Int, body: String)
 }
 
-/// Notifies Sonarr that a file has been resynced, so it refreshes its
-/// internal state (DownloadedEpisodesScan command). Structurally correct
-/// against Sonarr's documented v3 API (same request-building pattern as the
-/// qBittorrent client), but — unlike qBittorrent — not verified against a
-/// live Sonarr instance.
+/// Asks Sonarr to rescan its library from disk after a resync — useful when
+/// the rename that triggered it didn't come from Sonarr itself (a manual
+/// move, another tool), so its view of file locations catches up. Verified
+/// against a live Sonarr 4.x: RescanSeries completes successfully, while
+/// the DownloadedEpisodesScan command previously used here reports 201 at
+/// the HTTP layer but *fails* inside Sonarr (visible only in its command
+/// history — it's the legacy drone-factory import, not a rescan).
 pub fn notify_file_synced(
   credentials: Credentials,
-  _path: String,
 ) -> Result(Nil, NotifyError) {
   use base_request <- result.try(
     request.to(credentials.url <> "/api/v3/command")
     |> result.map_error(fn(_) { InvalidUrl(credentials.url) }),
   )
 
-  let body = json.object([#("name", json.string("DownloadedEpisodesScan"))])
+  let body = json.object([#("name", json.string("RescanSeries"))])
 
   let http_request =
     base_request

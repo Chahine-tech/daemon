@@ -1,13 +1,17 @@
 import arr_sync/client/qbittorrent
 import arr_sync/config
 import arr_sync/matcher/piece_hasher
+import arr_sync/matcher/torrent_file
 import arr_sync/matcher/torrent_index
+import arr_sync/paths
 import arr_sync/watcher/fs_watcher
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 import gleeunit
+import simplifile
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -78,6 +82,7 @@ fn sample_entry(
     files: [],
     piece_size: 4_194_304,
     piece_hashes:,
+    algorithm: piece_hasher.Sha1Flat,
   )
 }
 
@@ -114,6 +119,7 @@ pub fn resolve_finds_the_file_containing_the_matched_piece_test() {
       ],
       piece_size: 4_194_304,
       piece_hashes: ["h0", "h1", "h2", "h3", "h4", "h5"],
+      algorithm: piece_hasher.Sha1Flat,
     )
   let index = torrent_index.build_index([entry])
 
@@ -188,6 +194,7 @@ fn misaligned_pack_entry() -> torrent_index.TorrentEntry {
     ],
     piece_size: 32_768,
     piece_hashes: numbered_hashes(132),
+    algorithm: piece_hasher.Sha1Flat,
   )
 }
 
@@ -251,6 +258,7 @@ pub fn size_candidates_skips_a_file_with_no_fully_contained_piece_test() {
       ],
       piece_size: 32_768,
       piece_hashes: ["h0", "h1", "h2", "h3"],
+      algorithm: piece_hasher.Sha1Flat,
     )
   let index = torrent_index.build_index([entry])
 
@@ -276,6 +284,7 @@ pub fn size_candidates_skips_a_file_whose_piece_range_contradicts_offsets_test()
       ],
       piece_size: 32_768,
       piece_hashes: numbered_hashes(54),
+      algorithm: piece_hasher.Sha1Flat,
     )
   let index = torrent_index.build_index([entry])
 
@@ -313,21 +322,21 @@ pub fn verify_size_candidates_keeps_only_the_candidate_whose_piece_matches_test(
     == [matching]
 }
 
-pub fn hash_first_pieces_matches_shasum_test() {
+pub fn hash_first_piece_matches_shasum_test() {
   // test/fixtures/sample.bin is 30 bytes; sha1 verified with `shasum -a 1`.
-  let assert Ok([hash]) =
-    piece_hasher.hash_first_pieces(
+  let assert Ok(hash) =
+    piece_hasher.hash_first_piece(
       "test/fixtures/sample.bin",
       piece_hasher.PieceSize(30),
-      1,
+      piece_hasher.Sha1Flat,
     )
   assert hash == "b67385b612cd52654273844aa0d8f35474821822"
 }
 
-pub fn find_first_match_tries_each_piece_size_until_one_matches_test() {
+pub fn find_first_match_tries_each_probe_until_one_matches_test() {
   // test/fixtures/sample.bin is 30 bytes, sha1 verified with `shasum -a 1`.
   // 999 is larger than the file, so hashing it fails and find_first_match
-  // must move on to the next candidate size instead of giving up.
+  // must move on to the next candidate probe instead of giving up.
   let lookup = fn(hash) {
     case hash == "b67385b612cd52654273844aa0d8f35474821822" {
       True -> torrent_index.Matched("torrent-a", hash)
@@ -338,21 +347,167 @@ pub fn find_first_match_tries_each_piece_size_until_one_matches_test() {
   let assert Ok(torrent_index.Matched(torrent_hash, _piece_hash)) =
     torrent_index.find_first_match(
       "test/fixtures/sample.bin",
-      [999, 30],
+      [
+        torrent_index.Probe(piece_size: 999, algorithm: piece_hasher.Sha1Flat),
+        torrent_index.Probe(piece_size: 30, algorithm: piece_hasher.Sha1Flat),
+      ],
       lookup,
     )
   assert torrent_hash == "torrent-a"
 }
 
-pub fn find_first_match_returns_error_when_no_size_matches_test() {
+pub fn find_first_match_returns_error_when_no_probe_matches_test() {
   let lookup = fn(_hash) { torrent_index.NoMatch }
 
   assert torrent_index.find_first_match(
       "test/fixtures/sample.bin",
-      [30],
+      [torrent_index.Probe(piece_size: 30, algorithm: piece_hasher.Sha1Flat)],
       lookup,
     )
     == Error(Nil)
+}
+
+pub fn parse_v2_extracts_piece_hashes_from_a_real_single_file_torrent_test() {
+  // test/fixtures/v2_single_file.torrent was created and exported by a real
+  // qBittorrent 5.2.2 (torrents/export); expected values cross-checked with
+  // an independent python bencode decoder.
+  let assert Ok(raw) =
+    simplifile.read_bits("test/fixtures/v2_single_file.torrent")
+  let assert Ok(metadata) = torrent_file.parse_v2(raw)
+
+  assert metadata.name == "v2movie.bin"
+  assert metadata.piece_length == 32_768
+  let assert [file] = metadata.files
+  assert file.path == "v2movie.bin"
+  assert file.size == 5_242_880
+  assert list.length(file.piece_hashes) == 160
+  let assert Ok(first_hash) = list.first(file.piece_hashes)
+  assert first_hash
+    == "0ba2a1950c8339cbb80071438448a00e033cc0b174c3e6857e4bdfd45057b571"
+}
+
+pub fn parse_v2_extracts_both_files_from_a_real_multi_file_torrent_test() {
+  let assert Ok(raw) =
+    simplifile.read_bits("test/fixtures/v2_multi_file.torrent")
+  let assert Ok(metadata) = torrent_file.parse_v2(raw)
+
+  assert metadata.name == "PackV2"
+  assert metadata.piece_length == 16_384
+  let assert [episode, small] =
+    list.sort(metadata.files, fn(a, b) { string.compare(a.path, b.path) })
+  assert episode.path == "episode.bin"
+  assert episode.size == 2_097_152
+  assert list.length(episode.piece_hashes) == 128
+  assert small.path == "small.dat"
+  assert small.size == 50_000
+  assert list.length(small.piece_hashes) == 4
+}
+
+pub fn parse_v2_rejects_a_v1_torrent_test() {
+  // A v1 torrent has no "meta version" — parse_v2 must refuse it rather
+  // than fabricate an entry with no v2 hashes.
+  let v1 = <<
+    "d4:infod4:name1:a12:piece lengthi32768e6:pieces20:aaaaaaaaaaaaaaaaaaaaee":utf8,
+  >>
+  assert torrent_file.parse_v2(v1) == Error(Nil)
+}
+
+pub fn hash_first_piece_v2_computes_the_merkle_root_of_a_partial_block_test() {
+  // A 30-byte file with a 16 KiB piece is a single partial block, so the
+  // v2 piece hash is just sha256 of the file — precomputed with hashlib.
+  let assert Ok(hash) =
+    piece_hasher.hash_first_piece(
+      "test/fixtures/sample.bin",
+      piece_hasher.PieceSize(16_384),
+      piece_hasher.Sha256Merkle,
+    )
+  assert hash
+    == "a528389f78049f96c5c57e2aed2570a4d1ed840e7a31c1faeedca695aca63cd7"
+}
+
+pub fn hash_first_piece_v2_pairs_two_blocks_into_a_merkle_root_test() {
+  // 20000 bytes with a 32 KiB piece = one full 16 KiB block + one partial:
+  // root = sha256(sha256(block0) <> sha256(block1)) — precomputed with
+  // hashlib.
+  let assert Ok(hash) =
+    piece_hasher.hash_first_piece(
+      "test/fixtures/v2_two_blocks.bin",
+      piece_hasher.PieceSize(32_768),
+      piece_hasher.Sha256Merkle,
+    )
+  assert hash
+    == "77800aa9c58a128513d1d3596bd8f37dde66a062764391a95933412e2d30e753"
+}
+
+fn v2_metadata() -> torrent_file.V2Metadata {
+  // Mirrors the real PackV2 layout (v2_multi_file.torrent), with short fake
+  // hashes: episode.bin pieces [0,127], small.dat pieces [128,131].
+  torrent_file.V2Metadata(name: "PackV2", piece_length: 16_384, files: [
+    torrent_file.V2File(
+      path: "episode.bin",
+      size: 2_097_152,
+      piece_hashes: numbered_hashes(128),
+    ),
+    torrent_file.V2File(path: "small.dat", size: 50_000, piece_hashes: [
+      "s0", "s1", "s2", "s3",
+    ]),
+  ])
+}
+
+fn v2_api_file(
+  name: String,
+  size: Int,
+  piece_range: #(Int, Int),
+) -> qbittorrent.RemoteTorrentFile {
+  qbittorrent.RemoteTorrentFile(name:, size:, progress: 1.0, piece_range:)
+}
+
+pub fn flatten_v2_piece_hashes_lays_files_out_on_global_numbering_test() {
+  let assert Ok(flattened) =
+    torrent_index.flatten_v2_piece_hashes(v2_metadata(), [
+      v2_api_file("PackV2/small.dat", 50_000, #(128, 131)),
+      v2_api_file("PackV2/episode.bin", 2_097_152, #(0, 127)),
+    ])
+
+  assert list.length(flattened) == 132
+  let assert Ok(first) = list.first(flattened)
+  assert first == "h0"
+  assert list.drop(flattened, 128) == ["s0", "s1", "s2", "s3"]
+}
+
+pub fn flatten_v2_piece_hashes_rejects_a_gap_in_piece_ranges_test() {
+  assert torrent_index.flatten_v2_piece_hashes(v2_metadata(), [
+      v2_api_file("PackV2/episode.bin", 2_097_152, #(0, 127)),
+      v2_api_file("PackV2/small.dat", 50_000, #(129, 132)),
+    ])
+    == Error(Nil)
+}
+
+pub fn flatten_v2_piece_hashes_rejects_a_hash_count_mismatch_test() {
+  assert torrent_index.flatten_v2_piece_hashes(v2_metadata(), [
+      v2_api_file("PackV2/episode.bin", 2_097_152, #(0, 126)),
+      v2_api_file("PackV2/small.dat", 50_000, #(127, 130)),
+    ])
+    == Error(Nil)
+}
+
+pub fn flatten_v2_piece_hashes_holds_a_sub_piece_file_slot_with_a_placeholder_test() {
+  // A file no larger than one piece has no piece layer; its single piece
+  // slot must be held so following files keep their numbering.
+  let metadata =
+    torrent_file.V2Metadata(name: "PackW", piece_length: 16_384, files: [
+      torrent_file.V2File(path: "tiny.nfo", size: 500, piece_hashes: []),
+      torrent_file.V2File(path: "episode.bin", size: 32_768, piece_hashes: [
+        "e0", "e1",
+      ]),
+    ])
+  let assert Ok(flattened) =
+    torrent_index.flatten_v2_piece_hashes(metadata, [
+      v2_api_file("PackW/tiny.nfo", 500, #(0, 0)),
+      v2_api_file("PackW/episode.bin", 32_768, #(1, 2)),
+    ])
+
+  assert flattened == ["", "e0", "e1"]
 }
 
 pub fn relative_to_strips_the_base_directory_test() {
@@ -373,6 +528,59 @@ pub fn relative_to_does_not_match_a_sibling_directory_with_the_same_prefix_test(
   // "/data/media" just because it shares a string prefix.
   assert torrent_index.relative_to("/data/media", "/data/media2/episode.mkv")
     == Error(Nil)
+}
+
+fn sample_mappings() -> List(paths.PathMapping) {
+  [
+    paths.PathMapping(remote: "/downloads", local: "/data/torrents"),
+    paths.PathMapping(remote: "/data/media", local: "/mnt/media"),
+  ]
+}
+
+pub fn to_local_swaps_a_mapped_prefix_test() {
+  assert paths.to_local(sample_mappings(), "/downloads/Show/episode.mkv")
+    == "/data/torrents/Show/episode.mkv"
+}
+
+pub fn to_local_leaves_an_unmapped_path_unchanged_test() {
+  assert paths.to_local(sample_mappings(), "/elsewhere/file.mkv")
+    == "/elsewhere/file.mkv"
+}
+
+pub fn to_local_does_not_match_a_sibling_directory_with_the_same_prefix_test() {
+  // "/downloads2" must not be rewritten just because it shares a string
+  // prefix with the "/downloads" mapping.
+  assert paths.to_local(sample_mappings(), "/downloads2/file.mkv")
+    == "/downloads2/file.mkv"
+}
+
+pub fn to_local_maps_the_prefix_itself_test() {
+  assert paths.to_local(sample_mappings(), "/data/media") == "/mnt/media"
+}
+
+pub fn to_remote_swaps_back_the_local_prefix_test() {
+  assert paths.to_remote(sample_mappings(), "/mnt/media/Show")
+    == "/data/media/Show"
+}
+
+pub fn canonicalize_resolves_a_symlinked_directory_test() {
+  // Built at runtime so the test works on any OS: real_dir/file.bin reached
+  // through link_dir -> real_dir must canonicalize to the real path.
+  let base = "test/fixtures/canonicalize_scratch"
+  let _ = simplifile.delete(base)
+  let assert Ok(Nil) = simplifile.create_directory_all(base <> "/real_dir")
+  let assert Ok(Nil) =
+    simplifile.create_symlink(to: "real_dir", from: base <> "/link_dir")
+
+  let canonical = paths.canonicalize(base <> "/link_dir/file.bin")
+
+  let assert Ok(Nil) = simplifile.delete(base)
+  assert canonical == base <> "/real_dir/file.bin"
+}
+
+pub fn canonicalize_leaves_a_plain_path_unchanged_test() {
+  assert paths.canonicalize("/no/such/path/anywhere.bin")
+    == "/no/such/path/anywhere.bin"
 }
 
 pub fn classify_ignores_directory_events_test() {
@@ -407,6 +615,8 @@ pub fn config_load_parses_a_full_config_test() {
   assert loaded.watch.paths == ["/data/media/movies", "/data/media/tv"]
   assert loaded.sync.recheck_delay_seconds == 5
   assert loaded.sync.min_file_size_mb == 10
+  assert loaded.path_mappings
+    == [paths.PathMapping(remote: "/downloads", local: "/data/torrents")]
 
   let assert Some(sonarr) = loaded.sonarr
   assert sonarr.url == "http://localhost:8989"
@@ -456,6 +666,7 @@ pub fn config_load_treats_missing_optional_sections_as_none_test() {
 
   assert loaded.sonarr == None
   assert loaded.radarr == None
+  assert loaded.path_mappings == []
 }
 
 pub fn config_load_fails_on_missing_file_test() {

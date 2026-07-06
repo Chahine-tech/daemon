@@ -92,7 +92,13 @@ services:
       - /data/media:/data/media    # must be the SAME path qBittorrent sees
 ```
 
-The one rule that matters: **arr-sync and qBittorrent must see the media at the same literal path** — matching relies on qBittorrent's `save_path` being meaningful on arr-sync's filesystem. Mount the same volume at the same place in both containers.
+The one rule that matters: **arr-sync must be able to make sense of qBittorrent's paths**. Simplest way: mount the same volume at the same place in both containers. If the mounts differ (qBittorrent sees `/data/media`, arr-sync sees `/media`), declare it — exactly like Sonarr/Radarr's Remote Path Mappings:
+
+```toml
+[[path_mappings]]
+remote = "/data/media"    # as qBittorrent reports it
+local = "/media"          # the same directory as arr-sync sees it
+```
 
 `arr-sync status` inside the container:
 
@@ -135,30 +141,29 @@ Every target runs the exported `build/erlang-shipment/entrypoint.sh` (a standalo
 | `[qbittorrent]` | `url`, `username`, `password` | qBittorrent WebUI. `password` can be omitted if the `QBITTORRENT_PASSWORD` env var is set (it wins over the file either way) |
 | `[watch]` | `paths` | Watched directories |
 | `[sync]` | `recheck_delay`, `min_file_size_mb` | Seconds to wait after `renameFile` before forcing a `recheck`; minimum file size (MB) before a Created event is worth hashing at all, to skip sidecar files (subtitles, `.nfo`, thumbnails) |
-| `[sonarr]` *(optional)* | `url`, `api_key` | Post-resync notification |
-| `[radarr]` *(optional)* | `url`, `api_key` | Post-resync notification |
+| `[[path_mappings]]` *(optional, repeatable)* | `remote`, `local` | Like Sonarr/Radarr's Remote Path Mappings: `remote` is a path prefix as qBittorrent reports it, `local` is the same directory as arr-sync sees it. Needed when qBittorrent runs in a container that mounts the media somewhere else |
+| `[sonarr]` *(optional)* | `url`, `api_key` | Post-resync disk rescan (`RescanSeries`) — catches Sonarr up when the rename didn't come from Sonarr itself |
+| `[radarr]` *(optional)* | `url`, `api_key` | Post-resync disk rescan (`RescanMovie`), same idea |
 
 ---
 
 ## Status
 
-**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent, `arr-sync start` booting the full daemon, `arr-sync status` querying it live from a separate process (including the resync success/failure counters — both a real resync failure and a real success were triggered and observed via `status`), hybrid (v1+v2) BitTorrent torrents matching correctly out of the box, two files moved at once resyncing in parallel (`status` answered mid-flight), a cross-seeded file (two torrents, same content, different infohashes) resyncing both torrents, a non-piece-aligned interior file of a v1 multi-file torrent without pad files matching via the by-size fallback and resyncing.
-
-**Not checked against a live instance**: Sonarr/Radarr notifications (HTTP client only, same shape as the qBittorrent one).
+**Works, checked against a live qBittorrent (Docker) and a real filesystem**: auth, `list/files/properties/pieceHashes`, `renameFile`/`setLocation`/`recheck`, the piece hasher (checked byte-for-byte against `shasum`), the filesystem watcher (real FSEvents stream), end-to-end resync on a renamed multi-file torrent, `arr-sync start` booting the full daemon, `arr-sync status` querying it live from a separate process (including the resync success/failure counters — both a real resync failure and a real success were triggered and observed via `status`), hybrid (v1+v2) BitTorrent torrents matching correctly out of the box, two files moved at once resyncing in parallel (`status` answered mid-flight), a cross-seeded file (two torrents, same content, different infohashes) resyncing both torrents, a non-piece-aligned interior file of a v1 multi-file torrent without pad files matching via the by-size fallback and resyncing, pure v2-only torrents (single-file and multi-file) matching via their exported piece layers and resyncing, a qBittorrent container mounting the media at a different path than the daemon (bridged by a `[[path_mappings]]` entry configured through a symlink, exercising both the mapping and the canonicalization) resyncing a cross-tree move end-to-end, the Sonarr and Radarr post-resync rescans landing as `completed | successful` in both apps' command histories.
 
 ---
 
 ## Gotchas
 
-### Pure BitTorrent v2 torrents can't be matched
+### Pure BitTorrent v2 torrents work — around a qBittorrent bug
 
-Hybrid (v1+v2) torrents work with no extra setup — qBittorrent reports their v1 SHA1 piece hashes unchanged. Pure v2-only torrents don't: qBittorrent's `pieceHashes` endpoint doesn't return real hashes for them (verified against 5.2.2 — it's raw bytes from the torrent's own metadata, not actual piece hashes, a qBittorrent/libtorrent bug we can't work around client-side). `arr-sync` detects this and skips indexing those torrents entirely rather than risk a bogus match, logging a warning instead. If your tracker requires pure v2 torrents specifically, `arr-sync` won't be able to resync them — hybrid works fine.
+Hybrid (v1+v2) torrents work with no extra setup — qBittorrent reports their v1 SHA1 piece hashes unchanged. Pure v2-only torrents are trickier: qBittorrent's `pieceHashes` endpoint doesn't return real hashes for them (verified against 5.2.2 — it's raw bytes from the torrent's own metadata, not actual piece hashes, a qBittorrent/libtorrent bug). `arr-sync` sidesteps the broken endpoint entirely: it fetches the original `.torrent` via `torrents/export`, parses the bencode itself, and reads the real SHA256 piece hashes from the v2 piece layers — then matches by computing the BEP 52 merkle root of a file's first piece (every v2 file starts on a piece boundary, so no alignment games needed). Verified live: single-file and multi-file pure v2 torrents both resync end-to-end.
 
-### Path resolution gotcha: `/tmp` vs `/private/tmp` on macOS
+The one v2 leftover: a file no larger than one piece has no piece-layer entry in the torrent, so it can't be piece-matched — irrelevant for media files, which dwarf every standard piece size.
 
-On macOS, `/tmp` is a symlink to `/private/tmp`, and FSEvents always reports the **resolved** path — `fs_watcher` sees `/private/tmp/...` even if the file lives under `/tmp/...`. If qBittorrent's `save_path` for a torrent was set using the unresolved `/tmp/...` form (e.g. that's what was passed when the torrent was added), `relative_to` in `torrent_index.gleam` compares two paths that look different but point at the same file, the match fails, and the resync silently no-ops.
+### Symlinked paths (macOS `/tmp`, etc.)
 
-Not an `arr-sync` bug — FSEvents and qBittorrent simply don't agree on symlink resolution. Keep `[watch] paths` and qBittorrent's save paths on the same resolved form (`/private/tmp/...`), or better, avoid `/tmp` for real deployments entirely — it's wiped on reboot anyway, `/data/media` or similar is the right call.
+Watchers report **resolved** paths (on macOS, FSEvents turns `/tmp/...` into `/private/tmp/...` — `/tmp` is a symlink), while qBittorrent stores whatever literal form it was given. Comparing the two used to silently no-op the resync. `arr-sync` now canonicalizes every path before comparing (save paths, mapping targets, event paths), so symlinked prefixes on the arr-sync side just work — verified live with a `/tmp`-form config against `/private/tmp` events. Paths that only exist on qBittorrent's side (behind a path mapping) stay literal, as they should.
 
 ### Boot-crash risk: `fs`'s native binary is missing
 
